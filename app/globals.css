@@ -1,0 +1,220 @@
+@import "tailwindcss";
+
+/* =============================================================================
+   BILLING PRO — design tokens (offline desktop)
+   ============================================================================= */
+
+@media (max-width: 768px) {
+  button, .button, [role="button"] {
+    min-height: 44px;
+    min-width: 44px;
+  }
+  .table-container {
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  input[type="date"], input[type="text"], input[type="email"], input[type="tel"] {
+    font-size: 16px;
+  }
+}
+
+:root {
+  --font-sans: "Plus Jakarta Sans", "Segoe UI", sans-serif;
+  --font-mono: "JetBrains Mono", "Cascadia Code", ui-monospace, monospace;
+
+  /* Canvas */
+  --background: #f3f5f4;
+  --foreground: #14201b;
+  --card: #ffffff;
+  --card-foreground: #14201b;
+  --popover: #ffffff;
+  --popover-foreground: #14201b;
+
+  /* Brand — forest green (reference) */
+  --primary: #0b6b45;
+  --primary-foreground: #ffffff;
+  --primary-hover: #095538;
+  --primary-soft: #e8f5ef;
+
+  --secondary: #eef2f0;
+  --secondary-foreground: #1a2e26;
+  --muted: #eef2f0;
+  --muted-foreground: #5b6b64;
+  --accent: #e8f5ef;
+  --accent-foreground: #0b6b45;
+
+  --destructive: #c62828;
+  --destructive-foreground: #ffffff;
+  --success: #0b6b45;
+  --warning: #c47a00;
+  --danger: #c62828;
+
+  --border: #dce3df;
+  --input: #dce3df;
+  --ring: #0b6b45;
+  --radius: 0.625rem;
+
+  /* Sidebar — charcoal */
+  --sidebar: #141816;
+  --sidebar-foreground: #c8d4ce;
+  --sidebar-primary: #0b6b45;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #1e2622;
+  --sidebar-accent-foreground: #f2f7f4;
+  --sidebar-border: #252d29;
+  --sidebar-ring: #0b6b45;
+  --sidebar-muted: #8a9a92;
+
+  --app-bg: var(--background);
+  --surface: var(--card);
+  --text-primary: var(--foreground);
+  --text-secondary: #3d4f47;
+  --text-muted: var(--muted-foreground);
+}
+
+@theme {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-mono);
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+
+  html {
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "ss01" on, "cv11" on;
+  }
+
+  /* Focus feedback */
+  :focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--ring) 70%, transparent);
+    outline-offset: 2px;
+  }
+
+  /* Smooth interactive feedback */
+  button, a, [role="button"] {
+    transition: background-color 140ms ease, color 140ms ease, border-color 140ms ease,
+      box-shadow 140ms ease, transform 100ms ease;
+  }
+
+  button:active:not(:disabled), [role="button"]:active {
+    transform: translateY(0.5px);
+  }
+
+  input, select, textarea {
+    transition: border-color 140ms ease, box-shadow 140ms ease;
+  }
+}
+
+/* Utility surfaces matching reference cards */
+.bp-card {
+  @apply rounded-xl border border-border bg-card shadow-sm;
+}
+
+.bp-section-title {
+  @apply text-sm font-semibold tracking-tight text-foreground;
+}
+
+.bp-label {
+  @apply mb-1.5 block text-xs font-medium text-muted-foreground;
+}
+
+.bp-input {
+  @apply h-10 w-full rounded-lg border border-input bg-white px-3 text-sm text-foreground
+    placeholder:text-muted-foreground focus:border-primary focus:outline-none focus:ring-2
+    focus:ring-primary/20;
+}
+
+/* Search inputs with a leading icon — keeps text clear of the glyph */
+.bp-input-icon {
+  @apply h-10 w-full rounded-lg border border-input bg-white py-2 pr-3 text-sm text-foreground
+    placeholder:text-muted-foreground focus:border-primary focus:outline-none focus:ring-2
+    focus:ring-primary/20;
+  padding-left: 2.75rem;
+}
+
+.bp-btn-primary {
+  @apply inline-flex h-10 items-center justify-center gap-2 rounded-lg bg-primary px-4 text-sm
+    font-semibold text-primary-foreground shadow-sm hover:bg-[var(--primary-hover)]
+    disabled:pointer-events-none disabled:opacity-50;
+}
+
+.bp-btn-outline {
+  @apply inline-flex h-10 items-center justify-center gap-2 rounded-lg border border-border
+    bg-white px-4 text-sm font-medium text-foreground hover:bg-secondary
+    disabled:pointer-events-none disabled:opacity-50;
+}
+
+.bp-badge {
+  @apply inline-flex items-center rounded-full px-2 py-0.5 text-[11px] font-semibold;
+}
+
+.bp-table {
+  @apply w-full border-collapse text-sm;
+}
+
+.bp-table th {
+  @apply border-b border-border bg-secondary/60 px-3 py-2.5 text-left text-xs font-semibold
+    uppercase tracking-wide text-muted-foreground;
+}
+
+.bp-table td {
+  @apply border-b border-border px-3 py-3 align-middle;
+}
+
+.bp-table tbody tr:hover {
+  background: color-mix(in srgb, var(--primary-soft) 55%, white);
+}
+
+@media print {
+  body.printing-labels * {
+    visibility: hidden !important;
+  }
+  body.printing-labels .barcode-label-sheet,
+  body.printing-labels .barcode-label-sheet * {
+    visibility: visible !important;
+  }
+  body.printing-labels .barcode-label-sheet {
+    position: absolute !important;
+    left: 0 !important;
+    top: 0 !important;
+    width: 100% !important;
+    box-shadow: none !important;
+    padding: 4mm !important;
+  }
+}

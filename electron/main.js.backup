@@ -1,0 +1,2453 @@
+const { app, BrowserWindow, ipcMain } = require('electron');
+const path = require('path');
+const { spawn } = require('child_process');
+const db = require('./db');
+
+// Import print utilities
+const fs = require('fs').promises;
+const fsSync = require('fs');
+const os = require('os');
+const { exec } = require('child_process');
+const util = require('util');
+const http = require('http');
+const PDFDocument = require('pdfkit');
+const ExcelJS = require('exceljs');
+const { dialog } = require('electron');
+
+const execAsync = util.promisify(exec);
+
+let mainWindow;
+let nextProcess;
+let isPortableMode = false;
+let adminPinVerifiedAt = null; // Timestamp when PIN was last verified
+const PIN_SESSION_TIMEOUT = 5 * 60 * 1000; // 5 minutes in milliseconds
+
+// Portable Mode Detection
+async function detectPortableMode() {
+  try {
+    const appPath = app.getAppPath();
+    const appDir = path.dirname(appPath);
+
+    // Check if app is running from a removable drive
+    if (process.platform === 'win32') {
+      // Windows: Check if the drive letter is not C: (system drive)
+      const driveLetter = appDir.substring(0, 2).toUpperCase();
+      if (driveLetter !== 'C:') {
+        // Additional check: try to write a test file to verify it's writable
+        try {
+          const testFile = path.join(appDir, 'portable_test.tmp');
+          await fs.writeFile(testFile, 'portable');
+          await fs.unlink(testFile);
+          isPortableMode = true;
+          console.log(`Portable mode detected. App directory: ${appDir}`);
+          return true;
+        } catch (error) {
+          // Not writable, not portable
+          console.log('App directory not writable, running in installed mode');
+          return false;
+        }
+      }
+    } else if (process.platform === 'darwin') {
+      // macOS: Check if running from /Volumes (removable drives)
+      if (appDir.startsWith('/Volumes/')) {
+        isPortableMode = true;
+        console.log(`Portable mode detected (macOS). App directory: ${appDir}`);
+        return true;
+      }
+    } else {
+      // Linux: Check if running from /media or /mnt (removable drives)
+      if (appDir.startsWith('/media/') || appDir.startsWith('/mnt/')) {
+        isPortableMode = true;
+        console.log(`Portable mode detected (Linux). App directory: ${appDir}`);
+        return true;
+      }
+    }
+
+    console.log('Running in installed mode');
+    return false;
+  } catch (error) {
+    console.error('Error detecting portable mode:', error);
+    return false;
+  }
+}
+
+// Get database path based on mode
+function getDatabasePath() {
+  if (isPortableMode) {
+    // In portable mode, store DB in app directory
+    const appPath = app.getAppPath();
+    const appDir = path.dirname(appPath);
+    return path.join(appDir, 'data', 'customers.db');
+  } else {
+    // In installed mode, use user data directory
+    const userDataPath = app.getPath('userData');
+    return path.join(userDataPath, 'customers.db');
+  }
+}
+
+// PIN verification and session management
+function isAdminPinVerified() {
+  if (!adminPinVerifiedAt) return false;
+
+  const now = Date.now();
+  const timeDiff = now - adminPinVerifiedAt;
+
+  return timeDiff < PIN_SESSION_TIMEOUT;
+}
+
+function verifyAdminPin(pin) {
+  if (!pin || pin.length < 4) {
+    return { success: false, message: 'PIN must be at least 4 digits' };
+  }
+
+  if (!global.db) {
+    return { success: false, message: 'Database not available' };
+  }
+
+  if (!global.db.isAdminPinSet()) {
+    return { success: false, message: 'Admin PIN not set. Please set up PIN first.' };
+  }
+
+  if (global.db.verifyAdminPin(pin)) {
+    adminPinVerifiedAt = Date.now();
+    return { success: true, message: 'PIN verified successfully' };
+  } else {
+    return { success: false, message: 'Incorrect PIN' };
+  }
+}
+
+function requireAdminPin() {
+  return !isAdminPinVerified();
+}
+
+function setAdminPin(pin) {
+  if (!pin || pin.length < 4) {
+    return { success: false, message: 'PIN must be at least 4 digits' };
+  }
+
+  if (!global.db) {
+    return { success: false, message: 'Database not available' };
+  }
+
+  global.db.setAdminPin(pin);
+  adminPinVerifiedAt = Date.now(); // Auto-verify when setting PIN
+
+  // Log audit event
+  global.db.logAuditEvent('ADMIN_PIN_SET', null, 'Admin PIN was configured/changed');
+
+  return { success: true, message: 'Admin PIN set successfully' };
+}
+
+// Settings validation and dynamic application
+function validateSetting(key, value) {
+  switch (key) {
+    case 'shop_name':
+      if (!value || value.trim().length === 0) {
+        return { valid: false, message: 'Shop name cannot be empty' };
+      }
+      if (value.length > 100) {
+        return { valid: false, message: 'Shop name too long (max 100 characters)' };
+      }
+      break;
+
+    case 'shop_address':
+      if (value && value.length > 200) {
+        return { valid: false, message: 'Address too long (max 200 characters)' };
+      }
+      break;
+
+    case 'invoice_prefix':
+      if (!value || value.trim().length === 0) {
+        return { valid: false, message: 'Invoice prefix cannot be empty' };
+      }
+      if (value.length > 10) {
+        return { valid: false, message: 'Invoice prefix too long (max 10 characters)' };
+      }
+      if (!/^[A-Z0-9]+$/.test(value)) {
+        return { valid: false, message: 'Invoice prefix must contain only uppercase letters and numbers' };
+      }
+      break;
+
+    case 'printer_type':
+      if (!['thermal', 'a4'].includes(value)) {
+        return { valid: false, message: 'Invalid printer type. Must be "thermal" or "a4"' };
+      }
+      break;
+
+    case 'backup_interval':
+      if (!['manual', 'daily', 'weekly'].includes(value)) {
+        return { valid: false, message: 'Invalid backup interval. Must be "manual", "daily", or "weekly"' };
+      }
+      break;
+
+    case 'currency_symbol':
+      if (value && value.length > 3) {
+        return { valid: false, message: 'Currency symbol too long (max 3 characters)' };
+      }
+      break;
+
+    case 'tax_rate':
+      const taxRate = parseFloat(value);
+      if (isNaN(taxRate) || taxRate < 0 || taxRate > 100) {
+        return { valid: false, message: 'Tax rate must be a number between 0 and 100' };
+      }
+      break;
+
+    case 'invoice_footer':
+      if (value && value.length > 500) {
+        return { valid: false, message: 'Invoice footer too long (max 500 characters)' };
+      }
+      break;
+  }
+
+  return { valid: true };
+}
+
+function applySettingDynamically(key, value) {
+  // Store setting globally for immediate access
+  if (!global.appSettings) {
+    global.appSettings = {};
+  }
+  global.appSettings[key] = value;
+
+  // Apply setting-specific logic
+  switch (key) {
+    case 'printer_type':
+      // Could trigger printer configuration changes
+      console.log(`Printer type changed to: ${value}`);
+      break;
+
+    case 'backup_interval':
+      // Could reschedule automatic backups
+      console.log(`Backup interval changed to: ${value}`);
+      break;
+
+    case 'currency_symbol':
+      // Update currency formatting globally
+      console.log(`Currency symbol changed to: ${value}`);
+      break;
+
+    default:
+      console.log(`Setting ${key} updated to: ${value}`);
+  }
+}
+
+// Load settings on app startup
+async function loadAppSettings() {
+  try {
+    if (!global.db) return;
+
+    // Define default settings
+    const defaultSettings = {
+      shop_name: 'My Shop',
+      shop_address: '123 Business St, City, State 12345',
+      invoice_prefix: 'INV',
+      printer_type: 'thermal', // 'thermal' or 'a4'
+      backup_interval: 'daily', // 'manual', 'daily', 'weekly'
+      currency_symbol: '₹',
+      tax_rate: '0',
+      invoice_footer: 'Thank you for your business!'
+    };
+
+    // Load settings from database with defaults
+    const settings = {};
+    for (const key of Object.keys(defaultSettings)) {
+      const value = global.db.getSetting(key);
+      settings[key] = value !== null ? value : defaultSettings[key];
+    }
+
+    global.appSettings = settings;
+    console.log('App settings loaded:', Object.keys(settings));
+  } catch (error) {
+    console.error('Error loading app settings:', error);
+  }
+}
+
+// Utility function for running heavy queries without blocking UI
+function runHeavyQuery(queryFn, ...args) {
+  return new Promise((resolve, reject) => {
+    // Run the query in the next tick to prevent UI blocking
+    setImmediate(async () => {
+      try {
+        const result = await queryFn(...args);
+        resolve(result);
+      } catch (error) {
+        reject(error);
+      }
+    });
+  });
+}
+
+function createErrorWindow(message) {
+  // Create a simple error window without data URLs
+  const errorWindow = new BrowserWindow({
+    width: 600,
+    height: 400,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+    },
+    resizable: false,
+    title: 'Invoice Manager - Error',
+    icon: path.join(__dirname, '../public/favicon.ico'),
+  });
+
+  // Load a simple HTML file or use a minimal inline approach
+  const errorHtml = `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Invoice Manager - Error</title>
+        <style>
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            text-align: center;
+          }
+          .container {
+            max-width: 500px;
+            padding: 2rem;
+          }
+          .error-icon {
+            font-size: 4rem;
+            margin-bottom: 1rem;
+          }
+          .title {
+            font-size: 1.5rem;
+            font-weight: 600;
+            margin-bottom: 1rem;
+          }
+          .message {
+            opacity: 0.9;
+            margin-bottom: 2rem;
+            line-height: 1.6;
+          }
+          .retry-btn {
+            background: white;
+            color: #667eea;
+            border: none;
+            padding: 0.75rem 1.5rem;
+            border-radius: 0.5rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: transform 0.2s;
+            margin: 0.5rem;
+          }
+          .retry-btn:hover {
+            transform: translateY(-2px);
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="error-icon">⚠️</div>
+          <h1 class="title">Application Error</h1>
+          <p class="message">${message}</p>
+          <button class="retry-btn" onclick="window.location.reload()">Retry</button>
+          <button class="retry-btn" onclick="window.close()">Close</button>
+        </div>
+      </body>
+    </html>
+  `;
+
+  errorWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(errorHtml)}`);
+
+  errorWindow.on('closed', () => {
+    // Exit the app when error window is closed
+    app.quit();
+  });
+}
+
+async function createWindow() {
+  // Create the browser window
+  mainWindow = new BrowserWindow({
+    width: 1200,
+    height: 800,
+    webPreferences: {
+      nodeIntegration: false,
+      contextIsolation: true,
+      preload: path.join(__dirname, 'preload.js'),
+    },
+  });
+
+  // Load the Next.js app using the detected port
+  const port = global.nextJsPort || 3000;
+  console.log(`Loading app from http://localhost:${port}`);
+
+  try {
+    await mainWindow.loadURL(`http://localhost:${port}`);
+    console.log(`✅ Successfully loaded app on port ${port}`);
+  } catch (error) {
+    console.error(`❌ Failed to load app on port ${port}:`, error);
+    createErrorWindow(`Failed to connect to application server on port ${port}.`);
+  }
+
+  // Open DevTools in development
+  if (process.env.NODE_ENV === 'development') {
+    mainWindow.webContents.openDevTools();
+  }
+
+  // Handle failed page loads
+  mainWindow.webContents.on('did-fail-load', (event, errorCode, errorDescription) => {
+    console.error('Page failed to load:', errorCode, errorDescription);
+    // Only show error for network/server errors
+    if (errorCode === -102 || errorCode === -105) { // ERR_CONNECTION_REFUSED, ERR_NAME_NOT_RESOLVED
+      createErrorWindow(`Failed to connect to application server. Error: ${errorDescription} (Code: ${errorCode})`);
+    }
+  });
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+}
+
+function startNextJs() {
+  // Start Next.js development server
+  nextProcess = spawn('npm', ['run', 'dev'], {
+    stdio: 'inherit',
+    shell: true,
+  });
+
+  nextProcess.on('close', (code) => {
+    console.log(`Next.js process exited with code ${code}`);
+  });
+}
+
+function checkNextJsReady() {
+  return new Promise((resolve) => {
+    let attempts = 0;
+    const maxAttempts = 60; // Check for up to 60 seconds
+    let lastCheckedPort = 3000;
+
+    const checkServer = () => {
+      attempts++;
+
+      const port = lastCheckedPort;
+      lastCheckedPort = port === 3000 ? 3001 : 3000; // Alternate between ports
+
+      console.log(`Checking Next.js server on port ${port} (attempt ${attempts})...`);
+
+      const req = http.request({
+        hostname: 'localhost',
+        port: port,
+        path: '/',
+        method: 'HEAD', // Use HEAD instead of GET for faster response
+        timeout: 3000
+      }, (res) => {
+        console.log(`Port ${port} responded with status ${res.statusCode}`);
+        if (res.statusCode === 200) {
+          console.log(`✅ Next.js server is ready on port ${port}!`);
+          resolve(port); // Return the port number
+        } else {
+          // Server responded but not ready, try again
+          if (attempts < maxAttempts) {
+            setTimeout(checkServer, 1000);
+          } else {
+            console.log('❌ Next.js server check timed out');
+            resolve(false);
+          }
+        }
+      });
+
+      req.on('error', (error) => {
+        console.log(`Port ${port} error: ${error.code}`);
+        // Try the other port or continue checking
+        if (attempts < maxAttempts) {
+          setTimeout(checkServer, 500);
+        } else {
+          console.log('❌ Next.js server check timed out after all attempts');
+          resolve(false);
+        }
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        console.log(`Port ${port} timed out`);
+        if (attempts < maxAttempts) {
+          setTimeout(checkServer, 500);
+        } else {
+          console.log('❌ Next.js server check timed out');
+          resolve(false);
+        }
+      });
+
+      req.end();
+    };
+
+    // Start checking immediately
+    checkServer();
+  });
+}
+
+app.whenReady().then(async () => {
+  // Detect portable mode before starting anything else
+  await detectPortableMode();
+
+  // Initialize database with integrity checking and auto-recovery
+  const dbPath = getDatabasePath();
+  let dbInitialized = false;
+  let readOnlyMode = false;
+  let recoveryMessage = null;
+
+  try {
+    // Check if database file exists and has content before running integrity checks
+    const dbExists = fsSync.existsSync(dbPath);
+    let dbHasContent = false;
+
+    if (dbExists) {
+      try {
+        const stats = fsSync.statSync(dbPath);
+        dbHasContent = stats.size > 1024; // At least 1KB of data
+      } catch (error) {
+        console.log('Could not check database file size:', error.message);
+      }
+    }
+
+    // First, try to initialize database normally
+    const dbModule = require('./db');
+    const skipIntegrityCheck = !dbExists || !dbHasContent; // Skip for new/small databases
+    const db = dbModule(dbPath, { skipIntegrityCheck });
+
+    // For development and new databases, be more permissive
+    const isDevelopment = process.env.NODE_ENV === 'development';
+    const isNewDatabase = !dbExists || !dbHasContent;
+
+    if (skipIntegrityCheck || db.isDatabaseValid || isNewDatabase || isDevelopment) {
+      // Database is valid, newly created, or we're in development mode
+      global.db = db;
+      dbInitialized = true;
+      console.log(skipIntegrityCheck ? 'Database initialized (new or empty)' :
+                  isNewDatabase ? 'Database initialized (new)' :
+                  isDevelopment ? 'Database initialized (development mode)' :
+                  'Database integrity check passed');
+    } else {
+      // Database is corrupted, try to recover
+      console.log('Database integrity check failed, attempting recovery...');
+      db.close();
+
+      const recoveryResult = await performDatabaseRecovery(dbPath);
+      if (recoveryResult.success) {
+        // Recovery successful, reinitialize
+        const recoveredDb = dbModule(recoveryResult.dbPath, { skipIntegrityCheck: true });
+        global.db = recoveredDb;
+        dbInitialized = true;
+        recoveryMessage = recoveryResult.message;
+        console.log('Database recovery successful:', recoveryResult.message);
+      } else {
+        // Recovery failed, try read-only mode
+        console.log('Database recovery failed, attempting read-only mode...');
+        try {
+          const readOnlyDb = dbModule(dbPath, { readOnly: true, skipIntegrityCheck: true });
+          global.db = readOnlyDb;
+          dbInitialized = true;
+          readOnlyMode = true;
+          recoveryMessage = 'Database corrupted and no valid backups found. App opened in read-only mode.';
+          console.log('Read-only mode activated');
+        } catch (error) {
+          console.error('Failed to open database in read-only mode:', error);
+          recoveryMessage = 'Critical error: Database corrupted and cannot be opened. Please contact support.';
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Error during database initialization:', error);
+    recoveryMessage = 'Error initializing database. App may not function correctly.';
+  }
+
+  // Store recovery status for IPC
+  global.dbStatus = {
+    initialized: dbInitialized,
+    readOnly: readOnlyMode,
+    recoveryMessage,
+    dbPath
+  };
+
+  // Load app settings
+  if (dbInitialized) {
+    await loadAppSettings();
+
+    // Set default PIN (5555) if not already set
+    if (!global.db.isAdminPinSet()) {
+      console.log('Setting default admin PIN to 5555');
+      global.db.setAdminPin('5555');
+    }
+  }
+
+  startNextJs();
+
+  // Wait for Next.js server to be ready before creating window
+  checkNextJsReady().then((readyPort) => {
+    if (readyPort) {
+      console.log(`🎉 Server ready on port ${readyPort}, creating window...`);
+      // Store the detected port for createWindow to use
+      global.nextJsPort = readyPort;
+      createWindow();
+    } else {
+      console.error('❌ Next.js server failed to start');
+      createErrorWindow('Next.js server failed to start. Please check the console for errors.');
+    }
+  }).catch((error) => {
+    console.error('Failed to check Next.js server:', error);
+    createErrorWindow('Failed to connect to application server.');
+  });
+
+  app.on('activate', () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+    }
+  });
+});
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') {
+    app.quit();
+  }
+});
+
+app.on('before-quit', () => {
+  if (nextProcess) {
+    nextProcess.kill();
+  }
+});
+
+// IPC handlers for customer operations
+ipcMain.handle('add-customer', async (event, customer) => {
+  if (global.dbStatus?.readOnly) {
+    throw new Error('Cannot add customer: Database is in read-only mode due to corruption');
+  }
+  try {
+    return global.db.addCustomer(customer.name, customer.phone);
+  } catch (error) {
+    console.error('Error adding customer:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('get-customers', async () => {
+  try {
+    return global.db.getAllCustomers();
+  } catch (error) {
+    console.error('Error getting customers:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('get-customers-with-stats', async () => {
+  try {
+    return global.db.getCustomersWithStats();
+  } catch (error) {
+    console.error('Error getting customers with stats:', error);
+    throw error;
+  }
+});
+
+// IPC handlers for invoice operations
+ipcMain.handle('create-invoice', async (event, invoiceData) => {
+  if (global.dbStatus?.readOnly) {
+    throw new Error('Cannot create invoice: Database is in read-only mode due to corruption');
+  }
+  try {
+    const { customerId, date, items } = invoiceData;
+    const invoice = global.db.createInvoice(customerId, date, items);
+
+    // Log audit event
+    global.db.logAuditEvent('INVOICE_CREATED', invoice.id.toString(), `Invoice ${invoice.invoice_no} created for customer ${customerId}`);
+
+    // Perform automatic backup after invoice creation
+    // Don't let backup failure stop the invoice creation
+    setImmediate(async () => {
+      try {
+        const backupResult = await performBackup();
+        if (backupResult.success) {
+          console.log('Automatic backup completed:', backupResult.message);
+        } else {
+          console.warn('Automatic backup failed:', backupResult.message);
+        }
+      } catch (error) {
+        console.error('Error during automatic backup:', error);
+      }
+    });
+
+    return invoice;
+  } catch (error) {
+    console.error('Error creating invoice:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('get-invoices-by-customer', async (event, customerId) => {
+  try {
+    return global.db.getInvoicesByCustomer(customerId);
+  } catch (error) {
+    console.error('Error getting invoices by customer:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('get-invoice-with-items', async (event, invoiceId) => {
+  try {
+    return global.db.getInvoiceWithItems(invoiceId);
+  } catch (error) {
+    console.error('Error getting invoice with items:', error);
+    throw error;
+  }
+});
+
+// Print invoice function
+function generateInvoiceHTML(invoice, settings = {}) {
+  const { invoice_no, date, customer_name, customer_phone, items, total } = invoice;
+  const {
+    shop_name = 'My Shop',
+    shop_address = '',
+    currency_symbol = '$',
+    invoice_footer = 'Thank you for your business!'
+  } = settings;
+
+  return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      <title>Invoice ${invoice_no}</title>
+      <style>
+        @media print {
+          @page {
+            size: 58mm auto;
+            margin: 0;
+          }
+          body {
+            width: 58mm;
+            margin: 0;
+            padding: 2mm;
+          }
+        }
+
+        @media screen and (min-width: 210mm) {
+          @page {
+            size: A4;
+            margin: 20mm;
+          }
+          body {
+            max-width: 210mm;
+            margin: 0 auto;
+            padding: 20mm;
+          }
+        }
+
+        body {
+          font-family: 'Courier New', monospace;
+          font-size: 10pt;
+          line-height: 1.2;
+          margin: 0;
+          padding: 0;
+          color: #000;
+        }
+
+        .header {
+          text-align: center;
+          border-bottom: 1px solid #000;
+          padding-bottom: 5pt;
+          margin-bottom: 10pt;
+        }
+
+        .company-name {
+          font-size: 14pt;
+          font-weight: bold;
+          margin-bottom: 3pt;
+        }
+
+        .invoice-title {
+          font-size: 12pt;
+          font-weight: bold;
+          margin-bottom: 8pt;
+        }
+
+        .invoice-details {
+          margin-bottom: 10pt;
+        }
+
+        .detail-row {
+          display: flex;
+          justify-content: space-between;
+          margin-bottom: 2pt;
+        }
+
+        .customer-info {
+          margin-bottom: 10pt;
+          border-bottom: 1px dashed #000;
+          padding-bottom: 5pt;
+        }
+
+        .items-header {
+          display: flex;
+          font-weight: bold;
+          border-bottom: 1px solid #000;
+          padding-bottom: 3pt;
+          margin-bottom: 5pt;
+        }
+
+        .item-row {
+          display: flex;
+          margin-bottom: 3pt;
+        }
+
+        .item-name {
+          flex: 2;
+          font-size: 9pt;
+        }
+
+        .item-qty {
+          flex: 0.5;
+          text-align: center;
+        }
+
+        .item-price {
+          flex: 0.8;
+          text-align: right;
+        }
+
+        .item-amount {
+          flex: 0.8;
+          text-align: right;
+        }
+
+        .total-section {
+          border-top: 1px solid #000;
+          padding-top: 5pt;
+          margin-top: 10pt;
+          text-align: right;
+        }
+
+        .total-label {
+          font-weight: bold;
+          font-size: 11pt;
+        }
+
+        .total-amount {
+          font-weight: bold;
+          font-size: 12pt;
+        }
+
+        .footer {
+          text-align: center;
+          margin-top: 15pt;
+          font-size: 8pt;
+          border-top: 1px dashed #000;
+          padding-top: 5pt;
+        }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <div class="company-name">${shop_name}</div>
+        <div class="invoice-title">INVOICE</div>
+      </div>
+
+      <div class="invoice-details">
+        <div class="detail-row">
+          <span>Invoice No:</span>
+          <span>${invoice_no}</span>
+        </div>
+        <div class="detail-row">
+          <span>Date:</span>
+          <span>${new Date(date).toLocaleDateString()}</span>
+        </div>
+      </div>
+
+      ${shop_address ? `
+      <div class="shop-address" style="margin-bottom: 10pt; font-size: 9pt; text-align: center;">
+        ${shop_address.replace(/\n/g, '<br>')}
+      </div>
+      ` : ''}
+
+      <div class="customer-info">
+        <div><strong>Customer:</strong> ${customer_name}</div>
+        <div><strong>Phone:</strong> ${customer_phone}</div>
+      </div>
+
+      <div class="items-header">
+        <div class="item-name">Item</div>
+        <div class="item-qty">Qty</div>
+        <div class="item-price">Price</div>
+        <div class="item-amount">Amount</div>
+      </div>
+
+      ${items.map(item => `
+        <div class="item-row">
+          <div class="item-name">${item.item_name}</div>
+          <div class="item-qty">${item.qty}</div>
+          <div class="item-price">${currency_symbol}${item.price.toFixed(2)}</div>
+          <div class="item-amount">${currency_symbol}${item.amount.toFixed(2)}</div>
+        </div>
+      `).join('')}
+
+            <div class="total-section">
+        <div class="detail-row">
+          <span class="total-label">TOTAL:</span>
+          <span class="total-amount">${currency_symbol}${total.toFixed(2)}</span>
+        </div>
+      </div>
+
+      <div class="footer">
+        ${invoice_footer}<br>
+        Printed on ${new Date().toLocaleString()}
+      </div>
+    </body>
+    </html>
+  `;
+}
+
+async function printInvoice(invoice) {
+  try {
+    // Create a new hidden browser window for printing
+    const printWindow = new BrowserWindow({
+      show: false,
+      width: 800,
+      height: 600,
+      webPreferences: {
+        nodeIntegration: false,
+        contextIsolation: true,
+      },
+    });
+
+    // Generate HTML content with current settings
+    const htmlContent = generateInvoiceHTML(invoice, global.appSettings);
+
+    // Load the HTML content
+    await printWindow.loadURL(`data:text/html;charset=utf-8,${encodeURIComponent(htmlContent)}`);
+
+    // Wait for content to load
+    await new Promise(resolve => setTimeout(resolve, 500));
+
+    // Print options for thermal printer (58mm)
+    const printOptions = {
+      silent: true,
+      printBackground: false,
+      deviceName: '', // Use default printer
+      margins: {
+        marginType: 'none'
+      },
+      pageSize: {
+        width: 58 * 1000, // 58mm in microns
+        height: 297 * 1000 // A4 height as fallback
+      }
+    };
+
+    // Print the invoice
+    const result = await printWindow.webContents.print(printOptions);
+
+    // Close the print window
+    printWindow.close();
+
+    return result;
+
+  } catch (error) {
+    console.error('Error printing invoice:', error);
+    throw error;
+  }
+}
+
+// Generate PDF invoice as fallback when printing fails
+async function generateInvoicePDF(invoice) {
+  try {
+    const { invoice_no, date, customer_name, customer_phone, items, total } = invoice;
+    const settings = global.appSettings || {};
+    const {
+      shop_name = 'My Shop',
+      shop_address = '',
+      currency_symbol = '$',
+      invoice_footer = 'Thank you for your business!'
+    } = settings;
+
+    // Show save dialog for PDF
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Save Invoice as PDF',
+      defaultPath: `invoice_${invoice_no}.pdf`,
+      filters: [{ name: 'PDF Files', extensions: ['pdf'] }]
+    });
+
+    if (result.canceled) {
+      throw new Error('PDF save cancelled by user');
+    }
+
+    // Create PDF
+    const doc = new PDFDocument({
+      margin: 50,
+      size: 'A4'
+    });
+
+    const writeStream = fsSync.createWriteStream(result.filePath);
+    doc.pipe(writeStream);
+
+    // Header
+    doc.fontSize(24).text('INVOICE', { align: 'center' });
+    doc.moveDown();
+
+    // Company info
+    doc.fontSize(16).text(shop_name, { align: 'center' });
+    if (shop_address) {
+      doc.fontSize(10).text(shop_address.replace(/\n/g, ', '), { align: 'center' });
+    }
+    doc.moveDown(2);
+
+    // Invoice details
+    doc.fontSize(12)
+      .text(`Invoice No: ${invoice_no}`)
+      .text(`Date: ${new Date(date).toLocaleDateString()}`)
+      .text(`Customer: ${customer_name}`)
+      .text(`Phone: ${customer_phone}`);
+    doc.moveDown();
+
+    // Items table
+    const tableTop = doc.y;
+    doc.fontSize(12).text('Items:', { underline: true });
+    doc.moveDown(0.5);
+
+    // Table headers
+    const headersY = doc.y;
+    doc.fontSize(10)
+      .text('Item', 50, headersY)
+      .text('Qty', 350, headersY)
+      .text('Price', 400, headersY)
+      .text('Amount', 470, headersY);
+
+    // Draw header line
+    doc.moveTo(50, headersY + 15).lineTo(550, headersY + 15).stroke();
+
+    // Table rows
+    let yPosition = headersY + 25;
+    items.forEach(item => {
+      doc.fontSize(9)
+        .text(item.item_name, 50, yPosition, { width: 290 })
+        .text(item.qty.toString(), 350, yPosition)
+        .text(`${currency_symbol}${item.price.toFixed(2)}`, 400, yPosition)
+        .text(`${currency_symbol}${item.amount.toFixed(2)}`, 470, yPosition);
+      yPosition += 20;
+    });
+
+    // Total
+    doc.moveDown(2);
+    doc.fontSize(14).text(`Total: ${currency_symbol}${total.toFixed(2)}`, { align: 'right' });
+
+    // Footer
+    doc.moveDown(2);
+    doc.fontSize(8).text(invoice_footer, { align: 'center' });
+    doc.moveDown(0.5);
+    doc.fontSize(8).text(`Generated on ${new Date().toLocaleString()}`, { align: 'center' });
+
+    doc.end();
+
+    return new Promise((resolve, reject) => {
+      writeStream.on('finish', () => {
+        resolve({
+          success: true,
+          message: `Invoice saved as PDF: ${result.filePath}`,
+          filePath: result.filePath
+        });
+      });
+      writeStream.on('error', (error) => {
+        reject(new Error(`PDF generation failed: ${error.message}`));
+      });
+    });
+
+  } catch (error) {
+    console.error('Error generating PDF:', error);
+    throw error;
+  }
+}
+
+// IPC handler for printing invoices
+ipcMain.handle('print-invoice', async (event, invoiceId) => {
+  try {
+    // First, get the full invoice data with items
+    const invoice = global.db.getInvoiceWithItems(invoiceId);
+    if (!invoice) {
+      throw new Error('Invoice not found');
+    }
+
+    // Try to print the invoice
+    try {
+      const result = await printInvoice(invoice);
+      return result;
+    } catch (printError) {
+      console.warn('Printing failed, attempting PDF fallback:', printError.message);
+
+      // Fallback to PDF generation if printing fails
+      try {
+        const pdfResult = await generateInvoicePDF(invoice);
+        return {
+          ...pdfResult,
+          fallbackUsed: true,
+          originalError: printError.message
+        };
+      } catch (pdfError) {
+        console.error('Both printing and PDF fallback failed:', pdfError);
+        throw new Error(`Printing failed: ${printError.message}. PDF fallback also failed: ${pdfError.message}`);
+      }
+    }
+  } catch (error) {
+    console.error('Error in print invoice handler:', error);
+    throw error;
+  }
+});
+
+// USB Drive Detection and Backup Functions
+async function detectRemovableDrives() {
+  try {
+    const drives = [];
+
+    if (process.platform === 'win32') {
+      // Windows: Check drive letters A-Z for removable drives
+      for (let i = 65; i <= 90; i++) { // A to Z
+        const driveLetter = String.fromCharCode(i);
+        const drivePath = `${driveLetter}:\\`;
+
+        try {
+          // Check if drive exists and is removable
+          const driveStats = await fs.stat(drivePath);
+
+          // Try to determine if it's removable by checking for specific files/folders
+          // or by attempting to write a test file (if we can)
+          let isRemovable = false;
+
+          try {
+            // Check if it's a USB drive by looking for typical USB characteristics
+            // Many USB drives have a specific folder structure or allow writing
+            const testFile = path.join(drivePath, 'usb_test.tmp');
+            await fs.writeFile(testFile, 'test');
+            await fs.unlink(testFile);
+            isRemovable = true; // If we can write/delete, it's likely removable
+          } catch (error) {
+            // If we can't write, check if it's not a system drive
+            if (!['C:', 'D:'].includes(driveLetter + ':')) {
+              // Try to read directory to see if it's accessible
+              await fs.readdir(drivePath);
+              isRemovable = true; // Assume it's removable if accessible and not C: or D:
+            }
+          }
+
+          if (isRemovable) {
+            drives.push({
+              letter: driveLetter + ':',
+              mountpoint: drivePath,
+              description: 'Removable Drive'
+            });
+          }
+        } catch (error) {
+          // Drive doesn't exist or not accessible, skip
+          continue;
+        }
+      }
+    } else if (process.platform === 'darwin') {
+      // macOS: Check /Volumes for removable drives
+      try {
+        const volumes = await fs.readdir('/Volumes');
+        for (const volume of volumes) {
+          const volumePath = `/Volumes/${volume}`;
+          try {
+            // Check if it's a removable drive (skip system volumes)
+            const stat = await fs.stat(volumePath);
+            if (stat.isDirectory() && !['Macintosh HD', 'System'].includes(volume)) {
+              drives.push({
+                letter: volume,
+                mountpoint: volumePath,
+                description: 'Removable Drive'
+              });
+            }
+          } catch (error) {
+            continue;
+          }
+        }
+      } catch (error) {
+        console.error('Error detecting macOS drives:', error);
+      }
+    } else {
+      // Linux: Check /media and /mnt for removable drives
+      const mountPaths = ['/media', '/mnt'];
+      for (const mountPath of mountPaths) {
+        try {
+          const items = await fs.readdir(mountPath);
+          for (const item of items) {
+            const itemPath = `${mountPath}/${item}`;
+            try {
+              const stat = await fs.stat(itemPath);
+              if (stat.isDirectory()) {
+                drives.push({
+                  letter: item,
+                  mountpoint: itemPath,
+                  description: 'Removable Drive'
+                });
+              }
+            } catch (error) {
+              continue;
+            }
+          }
+        } catch (error) {
+          // Mount path doesn't exist, continue
+          continue;
+        }
+      }
+    }
+
+    return drives;
+  } catch (error) {
+    console.error('Error detecting removable drives:', error);
+    return [];
+  }
+}
+
+async function createBackupFolder(drivePath) {
+  const backupFolder = path.join(drivePath, 'BILLING_BACKUP');
+  try {
+    await fs.mkdir(backupFolder, { recursive: true });
+    return backupFolder;
+  } catch (error) {
+    console.error('Error creating backup folder:', error);
+    throw error;
+  }
+}
+
+async function performBackup() {
+  try {
+    // Get database path (works for both portable and installed modes)
+    const dbPath = getDatabasePath();
+
+    // Detect removable drives
+    const drives = await detectRemovableDrives();
+
+    if (drives.length === 0) {
+      console.warn('No removable drives found for backup');
+      return { success: false, message: 'No removable USB drive detected' };
+    }
+
+    // Use the first available drive
+    const drive = drives[0];
+    console.log(`Using drive: ${drive.mountpoint}`);
+
+    // Create backup folder
+    const backupFolder = await createBackupFolder(drive.mountpoint);
+
+    // Generate timestamped filename
+    const now = new Date();
+    const timestamp = now.toISOString()
+      .replace(/[:.]/g, '-')
+      .replace('T', '_')
+      .slice(0, -5); // Remove milliseconds and Z
+    const backupFilename = `backup_${timestamp}.db`;
+    const backupPath = path.join(backupFolder, backupFilename);
+
+    // Copy database file
+    await fs.copyFile(dbPath, backupPath);
+    console.log(`Database backed up to: ${backupPath}`);
+
+    // Log audit event
+    global.db.logAuditEvent('BACKUP_CREATED', backupFilename, `Backup created on drive ${drive.letter}`);
+
+    // Clean up old backups (keep only last 10)
+    await cleanupOldBackups(backupFolder);
+
+    return {
+      success: true,
+      message: `Backup created: ${backupFilename}`,
+      drive: drive.letter,
+      path: backupPath
+    };
+
+  } catch (error) {
+    console.error('Error performing backup:', error);
+    return { success: false, message: `Backup failed: ${error.message}` };
+  }
+}
+
+async function cleanupOldBackups(backupFolder) {
+  try {
+    // Get all backup files
+    const files = await fs.readdir(backupFolder);
+    const backupFiles = files
+      .filter(file => file.startsWith('backup_') && file.endsWith('.db'))
+      .map(file => ({
+        name: file,
+        path: path.join(backupFolder, file),
+        stats: null
+      }));
+
+    // Get file stats for sorting by modification time
+    for (const file of backupFiles) {
+      try {
+        file.stats = await fs.stat(file.path);
+      } catch (error) {
+        console.error(`Error getting stats for ${file.path}:`, error);
+      }
+    }
+
+    // Filter out files without stats and sort by modification time (newest first)
+    const validFiles = backupFiles
+      .filter(file => file.stats)
+      .sort((a, b) => b.stats.mtime.getTime() - a.stats.mtime.getTime());
+
+    // Keep only the last 10 backups
+    if (validFiles.length > 10) {
+      const filesToDelete = validFiles.slice(10);
+      for (const file of filesToDelete) {
+        try {
+          await fs.unlink(file.path);
+          console.log(`Deleted old backup: ${file.name}`);
+        } catch (error) {
+          console.error(`Error deleting ${file.path}:`, error);
+        }
+      }
+    }
+
+  } catch (error) {
+    console.error('Error cleaning up old backups:', error);
+  }
+}
+
+async function getBackupStatus() {
+  try {
+    const drives = await detectRemovableDrives();
+    const hasDrive = drives.length > 0;
+
+    let lastBackup = null;
+    let backupCount = 0;
+
+    if (hasDrive) {
+      const drive = drives[0];
+      const backupFolder = path.join(drive.mountpoint, 'BILLING_BACKUP');
+
+      try {
+        const files = await fs.readdir(backupFolder);
+        const backupFiles = files.filter(file => file.startsWith('backup_') && file.endsWith('.db'));
+
+        if (backupFiles.length > 0) {
+          // Get the most recent backup
+          let newestFile = null;
+          let newestTime = 0;
+
+          for (const file of backupFiles) {
+            try {
+              const filePath = path.join(backupFolder, file);
+              const stats = await fs.stat(filePath);
+              if (stats.mtime.getTime() > newestTime) {
+                newestTime = stats.mtime.getTime();
+                newestFile = file;
+              }
+            } catch (error) {
+              continue;
+            }
+          }
+
+          if (newestFile) {
+            lastBackup = new Date(newestTime).toLocaleString();
+            backupCount = backupFiles.length;
+          }
+        }
+      } catch (error) {
+        // Backup folder doesn't exist yet
+      }
+    }
+
+    return {
+      hasDrive,
+      driveLetter: hasDrive ? drives[0].letter : null,
+      lastBackup,
+      backupCount
+    };
+
+  } catch (error) {
+    console.error('Error getting backup status:', error);
+    return {
+      hasDrive: false,
+      driveLetter: null,
+      lastBackup: null,
+      backupCount: 0
+    };
+  }
+}
+
+// Export Functions
+async function exportInvoicesToPDF(dateRange) {
+  try {
+    const { startDate, endDate } = dateRange;
+
+    // Get invoices with items
+    const invoices = global.db.getInvoicesByCustomer(null); // Get all invoices first
+    const filteredInvoices = invoices.filter(invoice =>
+      invoice.date >= startDate && invoice.date <= endDate
+    );
+
+    if (filteredInvoices.length === 0) {
+      throw new Error('No invoices found in the selected date range');
+    }
+
+    // Show save dialog
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export Invoices to PDF',
+      defaultPath: `invoices_${startDate}_to_${endDate}.pdf`,
+      filters: [{ name: 'PDF Files', extensions: ['pdf'] }]
+    });
+
+    if (result.canceled) return { success: false, message: 'Export cancelled' };
+
+    // Create PDF
+    const doc = new PDFDocument({ margin: 50 });
+    const writeStream = fsSync.createWriteStream(result.filePath);
+    doc.pipe(writeStream);
+
+    // Header
+    doc.fontSize(20).text('Invoice Report', { align: 'center' });
+    doc.moveDown();
+    doc.fontSize(12).text(`Period: ${new Date(startDate).toLocaleDateString()} to ${new Date(endDate).toLocaleDateString()}`, { align: 'center' });
+    doc.moveDown(2);
+
+    // Summary
+    const totalRevenue = filteredInvoices.reduce((sum, inv) => sum + inv.total, 0);
+    const totalInvoices = filteredInvoices.length;
+    const avgValue = totalRevenue / totalInvoices;
+
+    doc.fontSize(14).text('Summary:', { underline: true });
+    doc.moveDown(0.5);
+    doc.fontSize(10)
+      .text(`Total Invoices: ${totalInvoices}`)
+      .text(`Total Revenue: $${totalRevenue.toFixed(2)}`)
+      .text(`Average Invoice Value: $${avgValue.toFixed(2)}`);
+    doc.moveDown();
+
+    // Invoice details
+    filteredInvoices.forEach((invoice, index) => {
+      if (index > 0) doc.addPage();
+
+      doc.fontSize(14).text(`Invoice: ${invoice.invoice_no}`, { underline: true });
+      doc.moveDown(0.5);
+      doc.fontSize(10)
+        .text(`Date: ${new Date(invoice.date).toLocaleDateString()}`)
+        .text(`Customer: ${invoice.customer_name}`)
+        .text(`Total: $${invoice.total.toFixed(2)}`);
+      doc.moveDown();
+
+      // Get invoice items
+      const invoiceWithItems = global.db.getInvoiceWithItems(invoice.id);
+      if (invoiceWithItems?.items) {
+        doc.fontSize(10).text('Items:', { underline: true });
+        doc.moveDown(0.5);
+
+        invoiceWithItems.items.forEach(item => {
+          doc.fontSize(9)
+            .text(`${item.item_name} - Qty: ${item.qty} - Price: $${item.price.toFixed(2)} - Amount: $${item.amount.toFixed(2)}`);
+        });
+      }
+
+      doc.moveDown(2);
+    });
+
+    // Footer
+    doc.fontSize(8).text(`Generated on ${new Date().toLocaleString()}`, { align: 'center' });
+
+    doc.end();
+
+    return new Promise((resolve) => {
+      writeStream.on('finish', () => {
+        resolve({ success: true, message: `PDF exported to ${result.filePath}` });
+      });
+      writeStream.on('error', (error) => {
+        resolve({ success: false, message: `Export failed: ${error.message}` });
+      });
+    });
+
+  } catch (error) {
+    console.error('Error exporting invoices to PDF:', error);
+    return { success: false, message: `Export failed: ${error.message}` };
+  }
+}
+
+async function exportReportsToExcel(dateRange) {
+  try {
+    const { startDate, endDate } = dateRange;
+
+    // Get all data
+    const salesAnalytics = global.db.getSalesAnalytics(startDate, endDate);
+    const topCustomers = global.db.getTopCustomers(startDate, endDate);
+    const repeatCustomers = global.db.getRepeatCustomers(startDate, endDate);
+    const allInvoices = global.db.getInvoicesByCustomer(null).filter(inv =>
+      inv.date >= startDate && inv.date <= endDate
+    );
+
+    // Show save dialog
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export Reports to Excel',
+      defaultPath: `reports_${startDate}_to_${endDate}.xlsx`,
+      filters: [{ name: 'Excel Files', extensions: ['xlsx'] }]
+    });
+
+    if (result.canceled) return { success: false, message: 'Export cancelled' };
+
+    // Create Excel workbook
+    const workbook = new ExcelJS.Workbook();
+    workbook.creator = 'Invoice Management System';
+    workbook.created = new Date();
+
+    // Sales Summary Sheet
+    const summarySheet = workbook.addWorksheet('Sales Summary');
+    summarySheet.columns = [
+      { header: 'Metric', key: 'metric', width: 25 },
+      { header: 'Value', key: 'value', width: 15 }
+    ];
+
+    summarySheet.addRow(['Report Period', `${startDate} to ${endDate}`]);
+    summarySheet.addRow(['Total Invoices', salesAnalytics.total_invoices]);
+    summarySheet.addRow(['Total Revenue', salesAnalytics.total_revenue]);
+    summarySheet.addRow(['Average Bill Value', salesAnalytics.avg_bill_value]);
+    summarySheet.addRow(['Highest Bill', salesAnalytics.highest_bill]);
+
+    // Style header row
+    summarySheet.getRow(1).font = { bold: true };
+    summarySheet.getRow(1).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFE6E6FA' }
+    };
+
+    // Top Customers Sheet
+    const customersSheet = workbook.addWorksheet('Top Customers');
+    customersSheet.columns = [
+      { header: 'Customer Name', key: 'name', width: 25 },
+      { header: 'Phone', key: 'phone', width: 15 },
+      { header: 'Invoice Count', key: 'invoice_count', width: 15 },
+      { header: 'Total Spent', key: 'total_spent', width: 15 }
+    ];
+
+    topCustomers.forEach(customer => {
+      customersSheet.addRow({
+        name: customer.name,
+        phone: customer.phone,
+        invoice_count: customer.invoice_count,
+        total_spent: customer.total_spent
+      });
+    });
+
+    // Style header
+    customersSheet.getRow(1).font = { bold: true };
+    customersSheet.getRow(1).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFE6E6FA' }
+    };
+
+    // Invoices Sheet
+    const invoicesSheet = workbook.addWorksheet('Invoices');
+    invoicesSheet.columns = [
+      { header: 'Invoice No', key: 'invoice_no', width: 15 },
+      { header: 'Date', key: 'date', width: 12 },
+      { header: 'Customer', key: 'customer_name', width: 25 },
+      { header: 'Total', key: 'total', width: 12 }
+    ];
+
+    allInvoices.forEach(invoice => {
+      invoicesSheet.addRow({
+        invoice_no: invoice.invoice_no,
+        date: invoice.date,
+        customer_name: invoice.customer_name,
+        total: invoice.total
+      });
+    });
+
+    // Style header
+    invoicesSheet.getRow(1).font = { bold: true };
+    invoicesSheet.getRow(1).fill = {
+      type: 'pattern',
+      pattern: 'solid',
+      fgColor: { argb: 'FFE6E6FA' }
+    };
+
+    // Save workbook
+    await workbook.xlsx.writeFile(result.filePath);
+
+    return { success: true, message: `Excel report exported to ${result.filePath}` };
+
+  } catch (error) {
+    console.error('Error exporting reports to Excel:', error);
+    return { success: false, message: `Export failed: ${error.message}` };
+  }
+}
+
+async function exportCustomerLedgerToCSV() {
+  try {
+    // Get all customers with their lifetime value
+    const customers = global.db.getCustomerLifetimeValue();
+
+    // Show save dialog
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: 'Export Customer Ledger to CSV',
+      defaultPath: `customer_ledger_${new Date().toISOString().split('T')[0]}.csv`,
+      filters: [{ name: 'CSV Files', extensions: ['csv'] }]
+    });
+
+    if (result.canceled) return { success: false, message: 'Export cancelled' };
+
+    // Create CSV content
+    const csvHeader = 'Customer Name,Phone,Total Invoices,Lifetime Value,Avg Order Value,First Purchase,Last Purchase,Customer Age (Days)\n';
+    const csvRows = customers.map(customer =>
+      `"${customer.name}","${customer.phone}",${customer.total_invoices},${customer.lifetime_value?.toFixed(2) || 0},${customer.avg_order_value?.toFixed(2) || 0},"${customer.first_purchase || ''}","${customer.last_purchase || ''}",${customer.customer_age_days || 0}`
+    ).join('\n');
+
+    const csvContent = csvHeader + csvRows;
+
+    // Write to file
+    await fs.writeFile(result.filePath, csvContent, 'utf8');
+
+    return { success: true, message: `Customer ledger exported to ${result.filePath}` };
+
+  } catch (error) {
+    console.error('Error exporting customer ledger to CSV:', error);
+    return { success: false, message: `Export failed: ${error.message}` };
+  }
+}
+
+// Restore Functions
+async function restoreFromBackup() {
+  try {
+    // Detect drives and find backups
+    const drives = await detectRemovableDrives();
+
+    if (drives.length === 0) {
+      return { success: false, message: 'No removable drives found' };
+    }
+
+    const drive = drives[0];
+    const backupFolder = path.join(drive.mountpoint, 'BILLING_BACKUP');
+
+    // Check if backup folder exists
+    try {
+      await fs.access(backupFolder);
+    } catch (error) {
+      return { success: false, message: 'No backup folder found on USB drive' };
+    }
+
+    // Get list of backup files
+    const files = await fs.readdir(backupFolder);
+    const backupFiles = files
+      .filter(file => file.startsWith('backup_') && file.endsWith('.db'))
+      .sort()
+      .reverse(); // Most recent first
+
+    if (backupFiles.length === 0) {
+      return { success: false, message: 'No backup files found' };
+    }
+
+    // Use the most recent backup
+    const latestBackup = backupFiles[0];
+    const backupPath = path.join(backupFolder, latestBackup);
+
+    // Get current database path (works for both portable and installed modes)
+    const dbPath = getDatabasePath();
+
+    // Create backup of current database before restore
+    const currentBackupPath = `${dbPath}.backup_${Date.now()}`;
+    try {
+      await fs.copyFile(dbPath, currentBackupPath);
+    } catch (error) {
+      console.warn('Could not create backup of current database:', error);
+    }
+
+    // Close current database connection
+    db.close();
+
+    // Copy backup file to database location
+    await fs.copyFile(backupPath, dbPath);
+
+    return {
+      success: true,
+      message: `Database restored from ${latestBackup}. App will restart.`,
+      backupUsed: latestBackup,
+      currentBackup: currentBackupPath
+    };
+
+  } catch (error) {
+    console.error('Error restoring from backup:', error);
+    return { success: false, message: `Restore failed: ${error.message}` };
+  }
+}
+
+// Database recovery functions
+async function performDatabaseRecovery(originalDbPath) {
+  try {
+    console.log('Starting database recovery process...');
+
+    // Define search paths for backups
+    const searchPaths = [];
+
+    // Add portable backup folder if in portable mode
+    if (isPortableMode) {
+      const appPath = app.getAppPath();
+      const appDir = path.dirname(appPath);
+      searchPaths.push(path.join(appDir, 'BILLING_BACKUP'));
+    }
+
+    // Add system backup folder
+    const userDataPath = app.getPath('userData');
+    searchPaths.push(path.join(userDataPath, 'BILLING_BACKUP'));
+
+    // Try to find removable drives and their backup folders
+    const drives = await detectRemovableDrives();
+    for (const drive of drives) {
+      searchPaths.push(path.join(drive.mountpoint, 'BILLING_BACKUP'));
+    }
+
+    // Find the latest valid backup
+    const dbModule = require('./db');
+    const tempDb = dbModule(originalDbPath, { skipIntegrityCheck: true });
+    const latestBackup = tempDb.findLatestValidBackup(searchPaths);
+    tempDb.close();
+
+    if (!latestBackup) {
+      return {
+        success: false,
+        message: 'No valid backups found'
+      };
+    }
+
+    console.log(`Found valid backup: ${latestBackup.path}`);
+
+    // Create backup of corrupted database before replacing
+    const corruptedBackupPath = `${originalDbPath}.corrupted_${Date.now()}`;
+    try {
+      await fs.copyFile(originalDbPath, corruptedBackupPath);
+      console.log(`Corrupted database backed up to: ${corruptedBackupPath}`);
+    } catch (error) {
+      console.warn('Could not backup corrupted database:', error);
+    }
+
+    // Restore from backup
+    await fs.copyFile(latestBackup.path, originalDbPath);
+    console.log(`Database restored from: ${latestBackup.path}`);
+
+    // Log audit event (using tempDb since main db might be corrupted)
+    tempDb.logAuditEvent('DATABASE_RESTORED', latestBackup.name, `Database restored from backup: ${latestBackup.name}`);
+
+    return {
+      success: true,
+      message: `Database restored from backup: ${latestBackup.name}`,
+      dbPath: originalDbPath,
+      backupUsed: latestBackup.name,
+      backupTime: latestBackup.time
+    };
+
+  } catch (error) {
+    console.error('Error during database recovery:', error);
+    return {
+      success: false,
+      message: `Recovery failed: ${error.message}`
+    };
+  }
+}
+
+// IPC handlers for backup operations
+ipcMain.handle('perform-backup', async () => {
+  try {
+    return await performBackup();
+  } catch (error) {
+    console.error('Error in backup IPC handler:', error);
+    return { success: false, message: `Backup failed: ${error.message}` };
+  }
+});
+
+ipcMain.handle('get-backup-status', async () => {
+  try {
+    return await getBackupStatus();
+  } catch (error) {
+    console.error('Error getting backup status:', error);
+    return {
+      hasDrive: false,
+      driveLetter: null,
+      lastBackup: null,
+      backupCount: 0
+    };
+  }
+});
+
+// IPC handlers for analytics operations
+ipcMain.handle('get-sales-analytics', async (event, dateRange) => {
+  try {
+    const { startDate, endDate } = dateRange;
+    return global.db.getSalesAnalytics(startDate, endDate);
+  } catch (error) {
+    console.error('Error getting sales analytics:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('get-top-customers', async (event, dateRange) => {
+  try {
+    const { startDate, endDate } = dateRange;
+    return global.db.getTopCustomers(startDate, endDate);
+  } catch (error) {
+    console.error('Error getting top customers:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('get-repeat-customers', async (event, dateRange) => {
+  try {
+    const { startDate, endDate } = dateRange;
+    return global.db.getRepeatCustomers(startDate, endDate);
+  } catch (error) {
+    console.error('Error getting repeat customers:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('get-inactive-customers', async (event, dateRange) => {
+  try {
+    const { startDate, endDate } = dateRange;
+    // For inactive customers, we check up to the end date for all historical data
+    // and then see who wasn't active in the selected period
+    return global.db.getInactiveCustomers(endDate, startDate, endDate);
+  } catch (error) {
+    console.error('Error getting inactive customers:', error);
+    throw error;
+  }
+});
+
+ipcMain.handle('get-customer-lifetime-value', async () => {
+  try {
+    return global.db.getCustomerLifetimeValue();
+  } catch (error) {
+    console.error('Error getting customer lifetime value:', error);
+    throw error;
+  }
+});
+
+// IPC handlers for export operations (protected)
+ipcMain.handle('export-invoices-pdf', async (event, dateRange) => {
+  if (requireAdminPin()) {
+    return { success: false, message: 'Admin PIN verification required' };
+  }
+
+  try {
+    return await exportInvoicesToPDF(dateRange);
+  } catch (error) {
+    console.error('Error in PDF export IPC handler:', error);
+    return { success: false, message: `Export failed: ${error.message}` };
+  }
+});
+
+ipcMain.handle('export-reports-excel', async (event, dateRange) => {
+  if (requireAdminPin()) {
+    return { success: false, message: 'Admin PIN verification required' };
+  }
+
+  try {
+    return await exportReportsToExcel(dateRange);
+  } catch (error) {
+    console.error('Error in Excel export IPC handler:', error);
+    return { success: false, message: `Export failed: ${error.message}` };
+  }
+});
+
+ipcMain.handle('export-customer-ledger-csv', async () => {
+  if (requireAdminPin()) {
+    return { success: false, message: 'Admin PIN verification required' };
+  }
+
+  try {
+    return await exportCustomerLedgerToCSV();
+  } catch (error) {
+    console.error('Error in CSV export IPC handler:', error);
+    return { success: false, message: `Export failed: ${error.message}` };
+  }
+});
+
+// IPC handler to check portable mode
+ipcMain.handle('is-portable-mode', async () => {
+  return isPortableMode;
+});
+
+// IPC handler to get database status
+ipcMain.handle('get-database-status', async () => {
+  return {
+    initialized: global.dbStatus?.initialized || false,
+    readOnly: global.dbStatus?.readOnly || false,
+    recoveryMessage: global.dbStatus?.recoveryMessage || null,
+    dbPath: global.dbStatus?.dbPath || null,
+    portableMode: isPortableMode
+  };
+});
+
+// PIN management IPC handlers
+ipcMain.handle('set-admin-pin', async (event, pin) => {
+  try {
+    return setAdminPin(pin);
+  } catch (error) {
+    console.error('Error setting admin PIN:', error);
+    return { success: false, message: `Error: ${error.message}` };
+  }
+});
+
+ipcMain.handle('verify-admin-pin', async (event, pin) => {
+  try {
+    return verifyAdminPin(pin);
+  } catch (error) {
+    console.error('Error verifying admin PIN:', error);
+    return { success: false, message: `Error: ${error.message}` };
+  }
+});
+
+ipcMain.handle('is-admin-pin-set', async () => {
+  try {
+    return global.db ? global.db.isAdminPinSet() : false;
+  } catch (error) {
+    console.error('Error checking admin PIN status:', error);
+    return false;
+  }
+});
+
+ipcMain.handle('is-admin-pin-verified', async () => {
+  return isAdminPinVerified();
+});
+
+// IPC handlers for settings management
+ipcMain.handle('get-all-settings', async () => {
+  try {
+    if (!global.db) return {};
+
+    // Define default settings
+    const defaultSettings = {
+      shop_name: 'My Shop',
+      shop_address: '123 Business St, City, State 12345',
+      invoice_prefix: 'INV',
+      printer_type: 'thermal', // 'thermal' or 'a4'
+      backup_interval: 'daily', // 'manual', 'daily', 'weekly'
+      currency_symbol: '₹',
+      tax_rate: '0',
+      invoice_footer: 'Thank you for your business!'
+    };
+
+    // Get actual settings from database
+    const settings = {};
+    for (const key of Object.keys(defaultSettings)) {
+      const value = global.db.getSetting(key);
+      settings[key] = value !== null ? value : defaultSettings[key];
+    }
+
+    return settings;
+  } catch (error) {
+    console.error('Error getting settings:', error);
+    return {};
+  }
+});
+
+ipcMain.handle('update-setting', async (event, { key, value }) => {
+  if (requireAdminPin()) {
+    return { success: false, message: 'Admin PIN verification required' };
+  }
+
+  try {
+    if (!global.db) {
+      return { success: false, message: 'Database not available' };
+    }
+
+    // Validate setting based on key
+    const validation = validateSetting(key, value);
+    if (!validation.valid) {
+      return { success: false, message: validation.message };
+    }
+
+    global.db.setSetting(key, value);
+
+    // Log audit event
+    global.db.logAuditEvent('SETTING_CHANGED', key, `Setting '${key}' updated to: ${value}`);
+
+    // Apply setting dynamically if possible
+    applySettingDynamically(key, value);
+
+    return { success: true, message: 'Setting updated successfully' };
+  } catch (error) {
+    console.error('Error updating setting:', error);
+    return { success: false, message: `Error updating setting: ${error.message}` };
+  }
+});
+
+ipcMain.handle('reset-settings', async () => {
+  if (requireAdminPin()) {
+    return { success: false, message: 'Admin PIN verification required' };
+  }
+
+  try {
+    if (!global.db) {
+      return { success: false, message: 'Database not available' };
+    }
+
+    // Reset to defaults (delete all settings except admin_pin)
+    const defaultSettings = {
+      shop_name: 'My Shop',
+      shop_address: '123 Business St, City, State 12345',
+      invoice_prefix: 'INV',
+      printer_type: 'thermal',
+      backup_interval: 'daily',
+      currency_symbol: '₹',
+      tax_rate: '0',
+      invoice_footer: 'Thank you for your business!'
+    };
+
+    // Get all current settings
+    const allSettingsKeys = [
+      'shop_name', 'shop_address', 'invoice_prefix', 'printer_type',
+      'backup_interval', 'currency_symbol', 'tax_rate', 'invoice_footer'
+    ];
+
+    for (const key of allSettingsKeys) {
+      const defaultValue = defaultSettings[key];
+      global.db.setSetting(key, defaultValue);
+    }
+
+    // Log audit event
+    global.db.logAuditEvent('SETTINGS_RESET', null, 'All settings reset to defaults');
+
+    return { success: true, message: 'Settings reset to defaults' };
+  } catch (error) {
+    console.error('Error resetting settings:', error);
+    return { success: false, message: `Error resetting settings: ${error.message}` };
+  }
+});
+
+// IPC handlers for connections (printers and USB drives)
+ipcMain.handle('scan-printers', async () => {
+  console.log('Scanning for printers...');
+  const printers = [];
+  console.log(`Found ${printers.length} printers:`, printers);
+  return printers;
+});
+
+ipcMain.handle('test-printer-connection', async (event, printerId) => {
+  try {
+    // Mock printer connection test
+    // In production, you'd actually test the printer connection
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    return { success: true, message: 'Printer connection successful' };
+  } catch (error) {
+    console.error('Error testing printer connection:', error);
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('scan-usb-drives', async () => {
+  console.log('Scanning for USB drives...');
+
+  // For now, return empty array - real detection will be added later
+  // This prevents syntax errors while keeping the app functional
+  const drives = [];
+
+  console.log(`Found ${drives.length} USB drives:`, drives);
+  return drives;
+});
+
+ipcMain.handle('set-selected-printer', async (event, printerId) => {
+          const driveData = JSON.parse(stdout);
+          const driveList = Array.isArray(driveData) ? driveData : [driveData];
+
+          for (const drive of driveList) {
+            if (drive.DriveLetter) {
+              const totalSize = drive.Size ? Math.round(drive.Size / (1024 * 1024 * 1024)) + 'GB' : 'Unknown';
+              const available = drive.SizeRemaining ? Math.round(drive.SizeRemaining / (1024 * 1024 * 1024)) + 'GB' : 'Unknown';
+
+              drives.push({
+                id: `usb-${drive.DriveLetter}`,
+                name: drive.FileSystemLabel || `Removable Drive (${drive.DriveLetter}:)`,
+                mountPoint: `${drive.DriveLetter}:`,
+                size: totalSize,
+                available: available,
+                status: 'mounted'
+              });
+            }
+          }
+        }
+      } catch (psError) {
+        console.warn('PowerShell USB drive detection failed, trying WMIC:', psError.message);
+
+        try {
+          // Fallback to WMIC
+          console.log('Running WMIC USB drive detection...');
+          const { stdout } = await execAsync('wmic logicaldisk where drivetype=2 get caption,description,size,freespace /format:csv', { timeout: 5000 });
+          console.log('WMIC USB output:', stdout);
+
+        const lines = stdout.split('\n').filter(line => line.trim());
+        for (let i = 1; i < lines.length; i++) {
+          const parts = lines[i].split(',');
+          if (parts.length >= 4) {
+            const [node, caption, description, size, freeSpace] = parts;
+
+            const totalSize = size ? Math.round(parseInt(size) / (1024 * 1024 * 1024)) + 'GB' : 'Unknown';
+            const available = freeSpace ? Math.round(parseInt(freeSpace) / (1024 * 1024 * 1024)) + 'GB' : 'Unknown';
+
+            drives.push({
+              id: `usb-${caption}`,
+              name: description || `Removable Drive (${caption})`,
+              mountPoint: caption,
+              size: totalSize,
+              available: available,
+              status: 'mounted'
+            });
+          }
+        }
+
+        // Fallback: Check drive letters manually if WMIC fails
+        if (drives.length === 0) {
+          for (let i = 68; i <= 90; i++) { // D to Z
+            const driveLetter = String.fromCharCode(i) + ':';
+            try {
+              const fs = require('fs').promises;
+              await fs.access(driveLetter + '\\');
+
+              // Try to get basic drive info
+              drives.push({
+                id: `usb-${driveLetter}`,
+                name: `Removable Drive (${driveLetter})`,
+                mountPoint: driveLetter,
+                size: 'Unknown',
+                available: 'Unknown',
+                status: 'mounted'
+              });
+            } catch (error) {
+              // Drive not accessible or doesn't exist
+            }
+          }
+        }
+      } catch (error) {
+        console.warn('Windows USB drive detection failed:', error);
+
+        // Basic fallback
+        for (let i = 68; i <= 90; i++) { // D to Z
+          const driveLetter = String.fromCharCode(i) + ':';
+          try {
+            const fs = require('fs').promises;
+            await fs.access(driveLetter + '\\');
+            drives.push({
+              id: `usb-${driveLetter}`,
+              name: `Drive (${driveLetter})`,
+              mountPoint: driveLetter,
+              size: 'Unknown',
+              available: 'Unknown',
+              status: 'mounted'
+            });
+          } catch (error) {
+            // Drive not accessible
+          }
+        }
+      }
+    if (process.platform === 'darwin') {
+      // macOS: Use system_profiler to get removable drives
+      try {
+        const { stdout } = await execAsync('system_profiler SPUSBDataType -json', { timeout: 5000 });
+        const data = JSON.parse(stdout);
+
+        if (data.SPUSBDataType) {
+          for (const device of data.SPUSBDataType) {
+            if (device._items) {
+              for (const item of device._items) {
+                if (item.bsd_name && item.volumes) {
+                  for (const volume of item.volumes) {
+                    if (volume.mount_point) {
+                      drives.push({
+                        id: `usb-${item.bsd_name}`,
+                        name: volume.name || `USB Drive (${item.bsd_name})`,
+                        mountPoint: volume.mount_point,
+                        size: volume.size_info ? Math.round(volume.size_info / (1024 * 1024 * 1024)) + 'GB' : 'Unknown',
+                        available: 'Unknown',
+                        status: 'mounted'
+                      });
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (error) {
+        console.warn('macOS USB drive detection failed:', error);
+
+        // Fallback to directory listing
+        try {
+          const fs = require('fs').promises;
+          const volumes = await fs.readdir('/Volumes');
+
+          for (const volume of volumes) {
+            if (!['Macintosh HD', 'System', 'Data'].includes(volume)) {
+              const mountPoint = `/Volumes/${volume}`;
+              try {
+                await fs.access(mountPoint);
+                drives.push({
+                  id: `usb-${volume}`,
+                  name: volume,
+                  mountPoint: mountPoint,
+                  size: 'Unknown',
+                  available: 'Unknown',
+                  status: 'mounted'
+                });
+              } catch (error) {
+                // Volume not accessible
+              }
+            }
+          }
+        } catch (fallbackError) {
+          console.warn('macOS USB drive fallback detection failed:', fallbackError);
+        }
+      }
+    if (process.platform === 'linux') {
+      // Linux: Use lsblk to detect removable drives
+      try {
+        const { stdout } = await execAsync('lsblk -o NAME,MOUNTPOINT,SIZE,FSTYPE,RM,LABEL -J', { timeout: 5000 });
+        const data = JSON.parse(stdout);
+
+        for (const device of data.blockdevices) {
+          if (device.rm === '1' && device.mountpoint) { // Removable and mounted
+            const size = device.size || 'Unknown';
+            const name = device.label || device.name || 'Removable Drive';
+
+            drives.push({
+              id: `usb-${device.name}`,
+              name: `${name} (${device.name})`,
+              mountPoint: device.mountpoint,
+              size: size,
+              available: 'Unknown', // Would need df command
+              status: 'mounted'
+            });
+          }
+        }
+      } catch (error) {
+        console.warn('Linux USB drive detection failed:', error);
+
+        // Fallback to directory listing
+        try {
+          const fs = require('fs').promises;
+          const mediaDirs = ['/media', '/mnt', '/media/user'];
+
+          for (const dir of mediaDirs) {
+            try {
+              const items = await fs.readdir(dir);
+              for (const item of items) {
+                const mountPoint = `${dir}/${item}`;
+                try {
+                  await fs.access(mountPoint);
+                  drives.push({
+                    id: `usb-${item}`,
+                    name: item,
+                    mountPoint: mountPoint,
+                    size: 'Unknown',
+                    available: 'Unknown',
+                    status: 'mounted'
+                  });
+                } catch (error) {
+                  // Mount point not accessible
+                }
+              }
+            } catch (error) {
+              // Directory not found or not accessible
+            }
+          }
+        } catch (fallbackError) {
+          console.warn('Linux USB drive fallback detection failed:', fallbackError);
+        }
+      }
+    }
+
+    console.log(`Found ${drives.length} USB drives:`, drives);
+    return drives;
+  } catch (error) {
+    console.error('Error scanning USB drives:', error);
+    return [];
+  }
+});
+
+ipcMain.handle('set-selected-printer', async (event, printerId) => {
+  try {
+    global.db.setSetting('selected_printer', printerId);
+    return { success: true, message: 'Default printer updated' };
+  } catch (error) {
+    console.error('Error setting selected printer:', error);
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('set-selected-usb-drive', async (event, usbDriveId) => {
+  try {
+    global.db.setSetting('selected_usb_drive', usbDriveId);
+    return { success: true, message: 'Default USB drive updated' };
+  } catch (error) {
+    console.error('Error setting selected USB drive:', error);
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('get-selected-devices', async () => {
+  try {
+    const selectedPrinter = global.db.getSetting('selected_printer') || '';
+    const selectedUsbDrive = global.db.getSetting('selected_usb_drive') || '';
+    return { selectedPrinter, selectedUsbDrive };
+  } catch (error) {
+    console.error('Error getting selected devices:', error);
+    return { selectedPrinter: '', selectedUsbDrive: '' };
+  }
+});
+
+ipcMain.handle('get-dashboard-stats', async () => {
+  try {
+    return global.db.getDashboardStats();
+  } catch (error) {
+    console.error('Error getting dashboard stats:', error);
+    return {
+      totalCustomers: 0,
+      totalRevenue: 0,
+      totalInvoices: 0,
+      activeCustomers: 0
+    };
+  }
+});
+
+// IPC handlers for audit logging
+ipcMain.handle('get-audit-logs', async (event, options = {}) => {
+  try {
+    const { limit = 100, offset = 0, action, startDate, endDate } = options;
+
+    if (!global.db) {
+      return [];
+    }
+
+    if (action) {
+      return global.db.getAuditLogsByAction(action, limit, offset);
+    } else if (startDate && endDate) {
+      return global.db.getAuditLogsByDateRange(startDate, endDate, limit, offset);
+    } else {
+      return global.db.getAuditLogs(limit, offset);
+    }
+  } catch (error) {
+    console.error('Error getting audit logs:', error);
+    return [];
+  }
+});
+
+// IPC handlers for paginated invoice queries
+ipcMain.handle('get-invoices-paginated', async (event, options = {}) => {
+  try {
+    const { limit = 50, offset = 0 } = options;
+
+    if (!global.db) {
+      return { invoices: [], total: 0 };
+    }
+
+    const invoices = global.db.getInvoicesPaginated(limit, offset);
+    const total = global.db.getInvoiceCount();
+
+    return { invoices, total, limit, offset };
+  } catch (error) {
+    console.error('Error getting paginated invoices:', error);
+    return { invoices: [], total: 0, limit, offset };
+  }
+});
+
+ipcMain.handle('get-invoices-by-customer-paginated', async (event, customerId, options = {}) => {
+  try {
+    const { limit = 50, offset = 0 } = options;
+
+    if (!global.db) {
+      return { invoices: [], total: 0 };
+    }
+
+    const invoices = global.db.getInvoicesByCustomerPaginated(customerId, limit, offset);
+    const total = global.db.getInvoiceCount(customerId);
+
+    return { invoices, total, limit, offset };
+  } catch (error) {
+    console.error('Error getting paginated customer invoices:', error);
+    return { invoices: [], total: 0, limit, offset };
+  }
+});
+
+// IPC handlers for optimized analytics
+ipcMain.handle('get-analytics-fast', async (event, dateRange) => {
+  try {
+    const { startDate, endDate } = dateRange;
+
+    if (!global.db) {
+      return null;
+    }
+
+    // Use runHeavyQuery to prevent UI blocking during analytics computation
+    const analyticsData = await runHeavyQuery(async () => {
+      // Use optimized queries for better performance
+      const [
+        salesData,
+        topCustomersData,
+        repeatCustomersData,
+        inactiveCustomersData,
+        lifetimeValueData
+      ] = await Promise.all([
+        global.db.getSalesAnalyticsFast(startDate, endDate),
+        global.db.getTopCustomersFast(startDate, endDate),
+        global.db.getRepeatCustomers(startDate, endDate),
+        global.db.getInactiveCustomers(endDate, startDate, endDate),
+        global.db.getCustomerLifetimeValue()
+      ]);
+
+      return {
+        salesAnalytics: salesData,
+        topCustomers: topCustomersData,
+        repeatCustomers: repeatCustomersData,
+        inactiveCustomers: inactiveCustomersData,
+        lifetimeValue: lifetimeValueData
+      };
+    });
+
+    return analyticsData;
+  } catch (error) {
+    console.error('Error getting fast analytics:', error);
+    return null;
+  }
+});
+
+// Protected operations - require PIN verification
+ipcMain.handle('restore-from-backup', async (event, options) => {
+  if (requireAdminPin()) {
+    return { success: false, message: 'Admin PIN verification required' };
+  }
+
+  try {
+    return await restoreFromBackup();
+  } catch (error) {
+    console.error('Error in restore IPC handler:', error);
+    return { success: false, message: `Restore failed: ${error.message}` };
+  }
+});
+
+ipcMain.handle('delete-invoice', async (event, invoiceId) => {
+  if (requireAdminPin()) {
+    return { success: false, message: 'Admin PIN verification required' };
+  }
+
+  try {
+    if (!global.db) {
+      return { success: false, message: 'Database not available' };
+    }
+
+    const deleted = global.db.deleteInvoice(invoiceId);
+
+    if (deleted) {
+      // Log audit event
+      global.db.logAuditEvent('INVOICE_DELETED', invoiceId.toString(), `Invoice ${invoiceId} deleted`);
+    }
+
+    return {
+      success: deleted,
+      message: deleted ? 'Invoice deleted successfully' : 'Invoice not found'
+    };
+  } catch (error) {
+    console.error('Error deleting invoice:', error);
+    return { success: false, message: `Delete failed: ${error.message}` };
+  }
+});
