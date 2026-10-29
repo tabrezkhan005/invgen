@@ -107,6 +107,7 @@ function createDatabase(dbPath) {
   ensureProductColumn('stock_qty', 'REAL NOT NULL DEFAULT 0');
   ensureProductColumn('low_stock_threshold', 'REAL NOT NULL DEFAULT 10');
   ensureProductColumn('unit', "TEXT NOT NULL DEFAULT 'Piece'");
+  ensureProductColumn('bill_name', 'TEXT');
 
   // Optional product link on invoice lines (for stock deduction)
   const invoiceItemCols = db.prepare(`PRAGMA table_info(invoice_items)`).all();
@@ -463,8 +464,8 @@ const getInvoiceCountByCustomerStmt = db.prepare(`
 
   // Products prepared statements
   const insertProductStmt = db.prepare(`
-    INSERT INTO products (name, code, sku, price, image_path, category_id, barcode_payload, stock_qty, low_stock_threshold, unit)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO products (name, code, sku, price, image_path, category_id, barcode_payload, stock_qty, low_stock_threshold, unit, bill_name)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
 
   const selectAllProductsStmt = db.prepare(`
@@ -486,7 +487,7 @@ const getInvoiceCountByCustomerStmt = db.prepare(`
   const updateProductStmt = db.prepare(`
     UPDATE products
     SET name = ?, code = ?, sku = ?, price = ?, image_path = ?, category_id = ?, barcode_payload = ?,
-        stock_qty = ?, low_stock_threshold = ?, unit = ?, updated_at = datetime('now')
+        stock_qty = ?, low_stock_threshold = ?, unit = ?, bill_name = ?, updated_at = datetime('now')
     WHERE id = ?
   `);
 
@@ -973,13 +974,14 @@ function getTopCustomersFast(startDate, endDate) {
     const stockQty = Number(data.stock_qty ?? 0);
     const lowThreshold = Number(data.low_stock_threshold ?? 10);
     const unit = String(data.unit || 'Piece').trim() || 'Piece';
+    const billName = String(data.bill_name || '').trim() || null;
 
     const existing = selectProductBySkuStmt.get(sku, sku);
     if (existing) throw new Error(`SKU "${sku}" already exists`);
 
     const result = insertProductStmt.run(
       name, sku, sku, price, imagePath, categoryId, barcodePayload,
-      stockQty, lowThreshold, unit
+      stockQty, lowThreshold, unit, billName
     );
     const productId = result.lastInsertRowid;
     replaceProductAttributes(productId, data.attributes || []);
@@ -993,12 +995,87 @@ function getTopCustomersFast(startDate, endDate) {
     return selectAllProductsStmt.all().map(enrichProduct);
   }
 
+  function buildVersatileSearchWhere(query) {
+    const raw = String(query || '').trim().toLowerCase();
+    if (!raw) return { clause: '', params: [] };
+
+    const normalized = raw
+      .replace(/[^\p{L}\p{N}\s]+/gu, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const tokens = normalized.split(' ').filter(Boolean);
+    const compact = normalized.replace(/\s+/g, '');
+    const tokenParams = [];
+    const tokenClauses = [];
+
+    // Each word must match somewhere (name/sku/code/barcode/category)
+    for (const token of tokens) {
+      const term = `%${token}%`;
+      tokenClauses.push(`(
+        LOWER(p.name) LIKE ? OR LOWER(IFNULL(p.code,'')) LIKE ? OR LOWER(IFNULL(p.sku,'')) LIKE ?
+        OR LOWER(IFNULL(p.barcode_payload,'')) LIKE ? OR LOWER(IFNULL(c.name,'')) LIKE ?
+      )`);
+      tokenParams.push(term, term, term, term, term);
+    }
+
+    const andTokens = tokenClauses.length ? `(${tokenClauses.join(' AND ')})` : null;
+
+    // Letter-order flex match so "gld" ~ "gold", "chn" ~ "chain"
+    let flexClause = null;
+    const flexParams = [];
+    if (compact.length >= 2 && compact.length <= 24) {
+      const flex = `%${compact.split('').join('%')}%`;
+      flexClause = `(
+        LOWER(REPLACE(p.name, ' ', '')) LIKE ?
+        OR LOWER(REPLACE(IFNULL(p.sku,''), ' ', '')) LIKE ?
+        OR LOWER(REPLACE(IFNULL(p.code,''), ' ', '')) LIKE ?
+      )`;
+      flexParams.push(flex, flex, flex);
+    }
+
+    if (andTokens && flexClause) {
+      return {
+        clause: `(${andTokens} OR ${flexClause})`,
+        params: [...tokenParams, ...flexParams],
+      };
+    }
+    if (andTokens) return { clause: andTokens, params: tokenParams };
+    if (flexClause) return { clause: flexClause, params: flexParams };
+    return { clause: '', params: [] };
+  }
+
   function searchProducts(query, limit = 50) {
-    const searchTerm = `%${query || ''}%`;
     const lim = Math.min(Math.max(Number(limit) || 50, 1), 200);
-    return selectProductsBySearchStmt
-      .all(searchTerm, searchTerm, searchTerm, searchTerm, lim)
-      .map(enrichProduct);
+    const { clause, params } = buildVersatileSearchWhere(query);
+    if (!clause) {
+      return db.prepare(`
+        SELECT p.*, c.name as category_name
+        FROM products p
+        LEFT JOIN product_categories c ON c.id = p.category_id
+        ORDER BY p.name ASC
+        LIMIT ?
+      `).all(lim).map(enrichProduct);
+    }
+
+    return db.prepare(`
+      SELECT p.*, c.name as category_name
+      FROM products p
+      LEFT JOIN product_categories c ON c.id = p.category_id
+      WHERE ${clause}
+      ORDER BY
+        CASE
+          WHEN LOWER(p.name) LIKE ? THEN 0
+          WHEN LOWER(IFNULL(p.sku,'')) LIKE ? THEN 1
+          ELSE 2
+        END,
+        p.name ASC
+      LIMIT ?
+    `).all(
+      ...params,
+      `${String(query || '').trim().toLowerCase()}%`,
+      `${String(query || '').trim().toLowerCase()}%`,
+      lim
+    ).map(enrichProduct);
   }
 
   function getProductsPaginated(options = {}) {
@@ -1014,10 +1091,10 @@ function getTopCustomersFast(startDate, endDate) {
     const where = [];
     const params = [];
 
-    if (query) {
-      const term = `%${query}%`;
-      where.push(`(p.name LIKE ? OR p.code LIKE ? OR p.sku LIKE ? OR IFNULL(p.barcode_payload, '') LIKE ?)`);
-      params.push(term, term, term, term);
+    const search = buildVersatileSearchWhere(query);
+    if (search.clause) {
+      where.push(search.clause);
+      params.push(...search.params);
     }
     if (categoryId != null && !Number.isNaN(categoryId)) {
       where.push('p.category_id = ?');
@@ -1033,6 +1110,7 @@ function getTopCustomersFast(startDate, endDate) {
     const countRow = db.prepare(`
       SELECT COUNT(*) as total
       FROM products p
+      LEFT JOIN product_categories c ON c.id = p.category_id
       ${whereSql}
     `).get(...params);
     const total = countRow?.total || 0;
@@ -1074,6 +1152,9 @@ function getTopCustomersFast(startDate, endDate) {
     const unit = String(
       productData.unit !== undefined ? productData.unit : (current.unit || 'Piece')
     ).trim() || 'Piece';
+    const billName = productData.bill_name !== undefined
+      ? (String(productData.bill_name || '').trim() || null)
+      : (current.bill_name || null);
 
     // Ensure unique sku if changing
     const conflict = selectProductBySkuStmt.get(sku, sku);
@@ -1084,7 +1165,7 @@ function getTopCustomersFast(startDate, endDate) {
     const prevStock = Number(current.stock_qty || 0);
     const result = updateProductStmt.run(
       name, sku, sku, price, imagePath || null, categoryId || null, barcodePayload,
-      stockQty, lowThreshold, unit, id
+      stockQty, lowThreshold, unit, billName, id
     );
     if (result.changes === 0) return false;
 
@@ -1148,6 +1229,18 @@ function getTopCustomersFast(startDate, endDate) {
     if (existing) return existing;
     const result = insertCategoryStmt.run(trimmed);
     return { id: result.lastInsertRowid, name: trimmed, created_at: new Date().toISOString() };
+  }
+
+  function updateCategory(id, name) {
+    const trimmed = String(name || '').trim();
+    if (!trimmed) throw new Error('Category name is required');
+    const conflict = selectCategoryByNameStmt.get(trimmed);
+    if (conflict && conflict.id !== id) {
+      throw new Error(`Category "${trimmed}" already exists`);
+    }
+    const result = db.prepare(`UPDATE product_categories SET name = ? WHERE id = ?`).run(trimmed, id);
+    if (result.changes === 0) return null;
+    return { id, name: trimmed };
   }
 
   function deleteCategory(id) {
@@ -1387,6 +1480,7 @@ function getInvoiceCount(customerId = null) {
     getProductByBarcode,
     getAllCategories,
     addCategory,
+    updateCategory,
     deleteCategory,
     adjustInventory,
     getInventorySummary,

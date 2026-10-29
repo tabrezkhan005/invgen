@@ -467,7 +467,7 @@ async function createWindow() {
     minHeight: 600,
     show: false,
     autoHideMenuBar: true,
-    title: 'Billing Pro',
+    title: 'AMGOLD',
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
@@ -580,69 +580,85 @@ async function startStaticFileServer() {
       };
 
       findAvailablePort(3000).then((port) => {
-        // Create HTTP server to serve static files
+        const contentTypes = {
+          '.html': 'text/html',
+          '.js': 'application/javascript',
+          '.mjs': 'application/javascript',
+          '.css': 'text/css',
+          '.json': 'application/json',
+          '.png': 'image/png',
+          '.jpg': 'image/jpeg',
+          '.jpeg': 'image/jpeg',
+          '.gif': 'image/gif',
+          '.svg': 'image/svg+xml',
+          '.ico': 'image/x-icon',
+          '.woff': 'font/woff',
+          '.woff2': 'font/woff2',
+          '.ttf': 'font/ttf',
+          '.eot': 'application/vnd.ms-fontobject',
+          '.txt': 'text/plain',
+          '.map': 'application/json',
+        };
+
+        function resolveStaticPath(urlPath) {
+          let pathname = decodeURIComponent((urlPath || '/').split('?')[0].split('#')[0]);
+          if (!pathname.startsWith('/')) pathname = `/${pathname}`;
+          if (pathname === '/') return path.join(staticDir, 'index.html');
+
+          const trimmed = pathname.replace(/\/+$/, '');
+          const candidates = [
+            path.join(staticDir, pathname),
+            path.join(staticDir, `${trimmed}.html`),
+            path.join(staticDir, trimmed, 'index.html'),
+            path.join(staticDir, pathname, 'index.html'),
+          ];
+
+          for (const candidate of candidates) {
+            try {
+              const resolved = path.resolve(candidate);
+              if (!resolved.startsWith(path.resolve(staticDir))) continue;
+              if (fsSync.existsSync(resolved) && fsSync.statSync(resolved).isFile()) {
+                return resolved;
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+          return null;
+        }
+
+        function sendFile(res, filePath) {
+          const ext = path.extname(filePath).toLowerCase();
+          const contentType = contentTypes[ext] || 'application/octet-stream';
+          fsSync.readFile(filePath, (err, data) => {
+            if (err) {
+              res.writeHead(500, { 'Content-Type': 'text/plain' });
+              res.end('Internal Server Error');
+              return;
+            }
+            res.writeHead(200, { 'Content-Type': contentType });
+            res.end(data);
+          });
+        }
+
+        // Create HTTP server to serve static Next export (supports /products and /products/)
         staticServer = http.createServer((req, res) => {
-          let filePath = path.join(staticDir, req.url === '/' ? 'index.html' : req.url);
+          const resolvedFile = resolveStaticPath(req.url || '/');
 
-          // Remove query string
-          filePath = filePath.split('?')[0];
-
-          // Security: prevent directory traversal
-          const resolvedPath = path.resolve(filePath);
-          const resolvedDir = path.resolve(staticDir);
-          if (!resolvedPath.startsWith(resolvedDir)) {
-            res.writeHead(403, { 'Content-Type': 'text/plain' });
-            res.end('Forbidden');
+          if (resolvedFile) {
+            sendFile(res, resolvedFile);
             return;
           }
 
-          // Check if file exists
-          fsSync.stat(filePath, (err, stats) => {
-            if (err || !stats.isFile()) {
-              // File not found, try serving index.html for client-side routing
-              const indexPath = path.join(staticDir, 'index.html');
-              fsSync.readFile(indexPath, (err, data) => {
-                if (err) {
-                  res.writeHead(404, { 'Content-Type': 'text/plain' });
-                  res.end('Not Found');
-                } else {
-                  res.writeHead(200, { 'Content-Type': 'text/html' });
-                  res.end(data);
-                }
-              });
-            } else {
-              // Determine content type
-              const ext = path.extname(filePath).toLowerCase();
-              const contentTypes = {
-                '.html': 'text/html',
-                '.js': 'application/javascript',
-                '.css': 'text/css',
-                '.json': 'application/json',
-                '.png': 'image/png',
-                '.jpg': 'image/jpeg',
-                '.jpeg': 'image/jpeg',
-                '.gif': 'image/gif',
-                '.svg': 'image/svg+xml',
-                '.ico': 'image/x-icon',
-                '.woff': 'font/woff',
-                '.woff2': 'font/woff2',
-                '.ttf': 'font/ttf',
-                '.eot': 'application/vnd.ms-fontobject',
-              };
+          // Fallback to index.html so client router can recover
+          const indexPath = path.join(staticDir, 'index.html');
+          if (fsSync.existsSync(indexPath)) {
+            sendFile(res, indexPath);
+            return;
+          }
 
-              const contentType = contentTypes[ext] || 'application/octet-stream';
-
-              fsSync.readFile(filePath, (err, data) => {
-                if (err) {
-                  res.writeHead(500, { 'Content-Type': 'text/plain' });
-                  res.end('Internal Server Error');
-                } else {
-                  res.writeHead(200, { 'Content-Type': contentType });
-                  res.end(data);
-                }
-              });
-            }
-          });
+          res.writeHead(404, { 'Content-Type': 'text/plain' });
+          res.end('Not Found');
         });
 
         staticServer.listen(port, 'localhost', () => {
@@ -3092,6 +3108,20 @@ ipcMain.handle('add-product-category', async (event, name) => {
     return { success: true, message: 'Category added', category };
   } catch (error) {
     console.error('Error adding category:', error);
+    return { success: false, message: error.message };
+  }
+});
+
+ipcMain.handle('update-product-category', async (event, { id, name }) => {
+  try {
+    if (!global.db) {
+      return { success: false, message: 'Database not available' };
+    }
+    const category = global.db.updateCategory(id, name);
+    if (!category) return { success: false, message: 'Category not found' };
+    return { success: true, message: 'Category updated', category };
+  } catch (error) {
+    console.error('Error updating category:', error);
     return { success: false, message: error.message };
   }
 });

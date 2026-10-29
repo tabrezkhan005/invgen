@@ -34,13 +34,20 @@ export function clearPendingBillItems(): void {
 }
 
 export function productToBillItem(
-  product: { id: number; name: string; sku?: string; price?: number },
+  product: {
+    id: number;
+    name: string;
+    bill_name?: string | null;
+    sku?: string;
+    price?: number;
+  },
   qty = 1
 ): PendingBillItem {
   const price = Number(product.price || 0);
   const quantity = Math.max(1, Number(qty) || 1);
+  const billName = String(product.bill_name || '').trim() || product.name;
   return {
-    item_name: product.name,
+    item_name: billName,
     qty: quantity,
     price,
     amount: price * quantity,

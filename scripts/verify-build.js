@@ -6,7 +6,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const appOutDir = process.argv[2] || path.join(__dirname, '..', 'distoct1', 'win-unpacked');
+const appOutDir = process.argv[2] || path.join(__dirname, '..', 'distoctf2', 'win-unpacked');
 const appPath = path.join(appOutDir, 'resources', 'app');
 
 console.log('Verifying build integrity...\n');

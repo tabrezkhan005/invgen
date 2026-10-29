@@ -84,6 +84,8 @@ contextBridge.exposeInMainWorld('electronAPI', {
   getProductByBarcode: (payload) => ipcRenderer.invoke('get-product-by-barcode', payload),
   getProductCategories: () => ipcRenderer.invoke('get-product-categories'),
   addProductCategory: (name) => ipcRenderer.invoke('add-product-category', name),
+  updateProductCategory: (id, name) =>
+    ipcRenderer.invoke('update-product-category', { id, name }),
   deleteProductCategory: (id) => ipcRenderer.invoke('delete-product-category', id),
   saveProductImage: (imageData, fileName) => ipcRenderer.invoke('save-product-image', { imageData, fileName }),
   getProductImage: (imagePath) => ipcRenderer.invoke('get-product-image', imagePath),

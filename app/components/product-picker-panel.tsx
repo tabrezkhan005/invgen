@@ -3,6 +3,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Search, Plus, Package, X, Maximize2 } from 'lucide-react';
 import { formatCurrency } from '@/lib/utils';
+import { ImageLightbox } from './image-lightbox';
+import { QtyPrompt } from './qty-prompt';
 import type { Product } from '@/types/electron';
 
 interface ProductPickerPanelProps {
@@ -16,6 +18,9 @@ export function ProductPickerPanel({ onAddProduct }: ProductPickerPanelProps) {
   const [results, setResults] = useState<Product[]>([]);
   const [images, setImages] = useState<Record<number, string>>({});
   const [loading, setLoading] = useState(false);
+  const [lightboxSrc, setLightboxSrc] = useState<string | null>(null);
+  const [lightboxAlt, setLightboxAlt] = useState('');
+  const [qtyProduct, setQtyProduct] = useState<Product | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const isElectron = typeof window !== 'undefined' && window.electronAPI;
 
@@ -23,6 +28,15 @@ export function ProductPickerPanel({ onAddProduct }: ProductPickerPanelProps) {
     if (!open) return;
     const t = setTimeout(() => inputRef.current?.focus(), 50);
     return () => clearTimeout(t);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prev;
+    };
   }, [open]);
 
   useEffect(() => {
@@ -83,7 +97,7 @@ export function ProductPickerPanel({ onAddProduct }: ProductPickerPanelProps) {
   }, [open]);
 
   function handleAdd(product: Product) {
-    onAddProduct(product, 1);
+    setQtyProduct(product);
   }
 
   const trimmed = query.trim();
@@ -171,7 +185,16 @@ export function ProductPickerPanel({ onAddProduct }: ProductPickerPanelProps) {
                       key={product.id}
                       className="flex gap-3 rounded-xl border border-border bg-white p-3 shadow-sm transition hover:border-primary/40 hover:shadow-md"
                     >
-                      <div className="h-28 w-28 shrink-0 overflow-hidden rounded-lg border border-border bg-secondary">
+                      <button
+                        type="button"
+                        className="h-28 w-28 shrink-0 overflow-hidden rounded-lg border border-border bg-secondary focus:outline-none focus:ring-2 focus:ring-primary/30"
+                        title={images[product.id] ? 'Click to enlarge' : undefined}
+                        onClick={() => {
+                          if (!images[product.id]) return;
+                          setLightboxSrc(images[product.id]);
+                          setLightboxAlt(product.name);
+                        }}
+                      >
                         {images[product.id] ? (
                           // eslint-disable-next-line @next/next/no-img-element
                           <img
@@ -185,7 +208,7 @@ export function ProductPickerPanel({ onAddProduct }: ProductPickerPanelProps) {
                             <span className="text-[10px]">No photo</span>
                           </div>
                         )}
-                      </div>
+                      </button>
                       <div className="flex min-w-0 flex-1 flex-col">
                         <p className="text-base font-bold leading-snug text-foreground">
                           {product.name}
@@ -231,6 +254,27 @@ export function ProductPickerPanel({ onAddProduct }: ProductPickerPanelProps) {
           </div>
         </div>
       )}
+
+      <ImageLightbox
+        open={Boolean(lightboxSrc)}
+        src={lightboxSrc}
+        alt={lightboxAlt}
+        onClose={() => {
+          setLightboxSrc(null);
+          setLightboxAlt('');
+        }}
+      />
+
+      <QtyPrompt
+        open={Boolean(qtyProduct)}
+        product={qtyProduct}
+        imageUrl={qtyProduct ? images[qtyProduct.id] : null}
+        onClose={() => setQtyProduct(null)}
+        onConfirm={(product, qty) => {
+          onAddProduct(product, qty);
+          setQtyProduct(null);
+        }}
+      />
     </>
   );
 }

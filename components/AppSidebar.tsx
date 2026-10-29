@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import Link from "next/link"
+import { useRouter } from "next/navigation"
 import {
   Receipt,
   FileText,
@@ -21,16 +21,18 @@ import {
 } from "@/components/ui/sidebar"
 
 const navMain = [
-  { title: "Create Invoice", url: "/billing", icon: Receipt },
-  { title: "Invoices", url: "/invoices", icon: FileText },
-  { title: "Products", url: "/products", icon: Package },
-  { title: "Inventory", url: "/inventory", icon: Warehouse },
-  { title: "Analytics", url: "/analytics", icon: BarChart3 },
-  { title: "Reports", url: "/reports", icon: PieChart },
-  { title: "Settings", url: "/settings", icon: Settings2 },
+  { title: "Create Invoice", url: "/billing/", icon: Receipt },
+  { title: "Invoices", url: "/invoices/", icon: FileText },
+  { title: "Products", url: "/products/", icon: Package },
+  { title: "Inventory", url: "/inventory/", icon: Warehouse },
+  { title: "Analytics", url: "/analytics/", icon: BarChart3 },
+  { title: "Reports", url: "/reports/", icon: PieChart },
+  { title: "Settings", url: "/settings/", icon: Settings2 },
 ]
 
 export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
+  const router = useRouter()
+
   return (
     <Sidebar
       collapsible="icon"
@@ -38,7 +40,11 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
       {...props}
     >
       <SidebarHeader className="border-b border-[var(--sidebar-border)] px-4 py-5">
-        <Link href="/billing" className="flex items-center gap-2.5 group-data-[collapsible=icon]:justify-center">
+        <button
+          type="button"
+          onClick={() => router.push("/billing/")}
+          className="flex w-full items-center gap-2.5 text-left group-data-[collapsible=icon]:justify-center"
+        >
           <div className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-[var(--sidebar-primary)] text-white shadow-sm">
             <Receipt className="size-4" />
           </div>
@@ -50,7 +56,7 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
               Offline billing
             </p>
           </div>
-        </Link>
+        </button>
       </SidebarHeader>
 
       <SidebarContent className="pt-3">
@@ -73,3 +79,4 @@ export function AppSidebar({ ...props }: React.ComponentProps<typeof Sidebar>) {
     </Sidebar>
   )
 }
+

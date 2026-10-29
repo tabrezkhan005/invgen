@@ -214,6 +214,7 @@ export interface Product {
   category_id: number | null;
   category_name?: string | null;
   barcode_payload?: string | null;
+  bill_name?: string | null;
   stock_qty: number;
   low_stock_threshold: number;
   unit: string;
@@ -232,6 +233,7 @@ export interface ProductInput {
   image_path?: string | null;
   category_id?: number | null;
   barcode_payload?: string;
+  bill_name?: string | null;
   stock_qty?: number;
   low_stock_threshold?: number;
   unit?: string;
@@ -384,6 +386,7 @@ export interface AuditLogOptions {
   getProductByBarcode: (payload: string) => Promise<Product | null>;
   getProductCategories: () => Promise<ProductCategory[]>;
   addProductCategory: (name: string) => Promise<ProductResult>;
+  updateProductCategory: (id: number, name: string) => Promise<ProductResult>;
   deleteProductCategory: (id: number) => Promise<ProductResult>;
   saveProductImage: (imageData: string, fileName: string) => Promise<{ success: boolean; imagePath?: string; fileName?: string; message?: string }>;
   getProductImage: (imagePath: string) => Promise<{ success: boolean; dataUrl?: string; message?: string }>;

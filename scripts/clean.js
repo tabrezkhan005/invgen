@@ -102,7 +102,7 @@ async function removeDir(dirPath, retries = 5) {
 
 // Directories to clean (default set, or from command line args)
 const args = process.argv.slice(2);
-const dirsToClean = args.length > 0 ? args : ['dist', 'dist-new1', 'dist-new2', 'dist-final', 'distoct_final', 'distoct1', 'out', '.next'];
+const dirsToClean = args.length > 0 ? args : ['dist', 'dist-new1', 'dist-new2', 'dist-final', 'distoct_final', 'distoct1', 'distoct2', 'distoctf1', 'distoctf2', 'out', '.next'];
 
 async function main() {
   console.log('Cleaning build directories...\n');

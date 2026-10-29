@@ -41,6 +41,12 @@ import {
   saveHeldBills,
   type HeldBill,
 } from '@/lib/held-bills';
+import {
+  BILL_DRAFT_KEY,
+  clearBillDraft,
+  loadBillDraft,
+  saveBillDraft,
+} from '@/lib/bill-draft';
 import type { Printer as ElectronPrinter, Product } from '@/types/electron';
 
 interface Customer {
@@ -184,6 +190,38 @@ export default function BillingPage() {
     saveHeldBills(heldBills);
   }, [heldBills, heldBillsReady]);
 
+  const [draftReady, setDraftReady] = useState(false);
+
+  // Persist active bill so switching tabs doesn't lose it
+  useEffect(() => {
+    if (!draftReady) return;
+    saveBillDraft({
+      customerName,
+      invoiceDate,
+      items,
+      taxRate,
+      discountType,
+      discountValue,
+      updatedAt: new Date().toISOString(),
+    });
+    // Keep legacy key in sync for older restore paths
+    try {
+      localStorage.setItem(
+        'lastInvoiceState',
+        JSON.stringify({
+          customerName,
+          invoiceDate,
+          items: items.filter((item) => item.item_name.trim() !== ''),
+          taxRate,
+          discountType,
+          discountValue,
+        })
+      );
+    } catch {
+      /* ignore */
+    }
+  }, [customerName, invoiceDate, items, taxRate, discountType, discountValue, draftReady]);
+
   const appendProductToBill = useCallback((product: Product, qty = 1) => {
     const billItem = productToBillItem(product, qty);
     setItems((prev) => {
@@ -219,6 +257,9 @@ export default function BillingPage() {
     setCustomerSearchOpen(false);
     setFilteredCustomers([]);
     setCurrentFocusIndex(0);
+    clearBillDraft();
+    localStorage.removeItem('lastInvoiceState');
+    localStorage.removeItem(BILL_DRAFT_KEY);
     // Reset date to now
     const now = new Date();
     const offset = now.getTimezoneOffset() * 60000;
@@ -586,16 +627,9 @@ export default function BillingPage() {
         console.log('📄 PDF generation completed');
       }
 
-      // Store current state for persistence
-      const currentState = {
-        customerName,
-        invoiceDate,
-        items: items.filter(item => item.item_name.trim() !== ''),
-        taxRate,
-        discountType,
-        discountValue
-      };
-      localStorage.setItem('lastInvoiceState', JSON.stringify(currentState));
+      // Bill completed — clear active draft (new bill starts after success dialog)
+      clearBillDraft();
+      localStorage.removeItem('lastInvoiceState');
 
       setRecentInvoices(prev => [result, ...prev.slice(0, 4)]); // Keep last 5 invoices
       loadInitialData();
@@ -629,12 +663,10 @@ export default function BillingPage() {
   };
 
   const handleNewBill = () => {
-    // Use startNewBill for consistent behavior
     startNewBill();
-    localStorage.removeItem('lastInvoiceState');
   };
 
-  // Load persistent state on mount
+  // Load persistent draft + pending catalog adds on mount
   useEffect(() => {
     const pending = readPendingBillItems();
     const mappedPending = pending.map((p) => ({
@@ -646,17 +678,31 @@ export default function BillingPage() {
       sku: p.sku,
     }));
 
-    const savedState = localStorage.getItem('lastInvoiceState');
-    if (savedState) {
+    const draft = loadBillDraft();
+    let legacy: any = null;
+    try {
+      const raw = localStorage.getItem('lastInvoiceState');
+      if (raw) legacy = JSON.parse(raw);
+    } catch {
+      legacy = null;
+    }
+
+    const state = draft || legacy;
+    if (state) {
       try {
-        const state = JSON.parse(savedState);
         setCustomerName(state.customerName || '');
-        setInvoiceDate(state.invoiceDate || (() => {
-          const now = new Date();
-          const offset = now.getTimezoneOffset() * 60000;
-          return new Date(now.getTime() - offset).toISOString().slice(0, 16);
-        })());
-        const restored: InvoiceItem[] = state.items || [{ item_name: '', qty: 1, price: 0, amount: 0 }];
+        setInvoiceDate(
+          state.invoiceDate ||
+            (() => {
+              const now = new Date();
+              const offset = now.getTimezoneOffset() * 60000;
+              return new Date(now.getTime() - offset).toISOString().slice(0, 16);
+            })()
+        );
+        const restored: InvoiceItem[] =
+          state.items?.length > 0
+            ? state.items
+            : [{ item_name: '', qty: 1, price: 0, amount: 0 }];
         if (mappedPending.length > 0) {
           const hasOnlyEmpty =
             restored.length === 1 &&
@@ -668,11 +714,11 @@ export default function BillingPage() {
         } else {
           setItems(restored);
         }
-        setTaxRate(state.taxRate || 0);
+        if (state.taxRate != null) setTaxRate(state.taxRate || 0);
         setDiscountType(state.discountType || 'percentage');
         setDiscountValue(state.discountValue || 0);
       } catch (error) {
-        console.error('Error loading saved state:', error);
+        console.error('Error loading saved draft:', error);
         if (mappedPending.length > 0) {
           setItems(mappedPending);
           clearPendingBillItems();
@@ -682,6 +728,7 @@ export default function BillingPage() {
       setItems(mappedPending);
       clearPendingBillItems();
     }
+    setDraftReady(true);
   }, []);
 
   if (!isElectron) return (

@@ -1,7 +1,6 @@
 'use client';
 
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { useRouter } from 'next/navigation';
 import {
   Plus, Search, ImagePlus, X, Package, Edit2, Trash2,
   ShoppingCart, Tag, LayoutGrid, List, Printer
@@ -9,6 +8,9 @@ import {
 import AppLayout from '../components/AppLayout';
 import { ProductBarcode } from '../components/product-barcode';
 import { BarcodeLabelSheet } from '../components/barcode-label-sheet';
+import { ProductDetailModal } from '../components/product-detail-modal';
+import { QtyPrompt } from '../components/qty-prompt';
+import { ToastNotify } from '../components/toast-notify';
 import { formatCurrency } from '@/lib/utils';
 import { productToBillItem, queuePendingBillItems } from '@/lib/pending-bill-items';
 import type { Product, ProductAttribute, ProductCategory } from '@/types/electron';
@@ -20,6 +22,7 @@ interface AttrDraft {
 
 interface ProductFormState {
   name: string;
+  bill_name: string;
   sku: string;
   price: string;
   category_id: number | null;
@@ -35,15 +38,19 @@ interface ProductFormState {
 function emptyForm(): ProductFormState {
   return {
     name: '',
+    bill_name: '',
     sku: '',
-    price: '0',
+    price: '',
     category_id: null,
     image_path: null,
     barcode_payload: '',
     stock_qty: '0',
     low_stock_threshold: '10',
     unit: 'Piece',
-    attributes: [],
+    attributes: [
+      { label: '', value: '' },
+      { label: '', value: '' },
+    ],
   };
 }
 
@@ -52,7 +59,6 @@ function buildDefaultPayload(sku: string, name: string, price: string) {
 }
 
 export default function ProductsPage() {
-  const router = useRouter();
   const [products, setProducts] = useState<Product[]>([]);
   const [categories, setCategories] = useState<ProductCategory[]>([]);
   const [searchQuery, setSearchQuery] = useState('');
@@ -73,6 +79,10 @@ export default function ProductsPage() {
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
   const [labelProducts, setLabelProducts] = useState<Product[]>([]);
   const [showLabels, setShowLabels] = useState(false);
+  const [detailProduct, setDetailProduct] = useState<Product | null>(null);
+  const [qtyProduct, setQtyProduct] = useState<Product | null>(null);
+  const [toastMessage, setToastMessage] = useState('');
+  const [toastOpen, setToastOpen] = useState(false);
 
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<Product | null>(null);
@@ -80,6 +90,15 @@ export default function ProductsPage() {
   const [newCategoryName, setNewCategoryName] = useState('');
 
   const isElectron = typeof window !== 'undefined' && window.electronAPI;
+
+  useEffect(() => {
+    if (!showForm) return;
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prev;
+    };
+  }, [showForm]);
 
   useEffect(() => {
     const t = setTimeout(() => setDebouncedSearch(searchQuery.trim()), 220);
@@ -220,10 +239,16 @@ export default function ProductsPage() {
 
   function openEdit(product: Product) {
     setEditingProduct(product);
+    const attrs = (product.attributes || []).map((a: ProductAttribute) => ({
+      label: a.label,
+      value: a.value,
+    }));
+    while (attrs.length < 2) attrs.push({ label: '', value: '' });
     setFormData({
       name: product.name,
+      bill_name: product.bill_name || '',
       sku: product.sku || product.code,
-      price: String(product.price ?? 0),
+      price: product.price != null && Number(product.price) !== 0 ? String(product.price) : '',
       category_id: product.category_id,
       image_path: product.image_path,
       barcode_payload:
@@ -232,10 +257,7 @@ export default function ProductsPage() {
       stock_qty: String(product.stock_qty ?? 0),
       low_stock_threshold: String(product.low_stock_threshold ?? 10),
       unit: product.unit || 'Piece',
-      attributes: (product.attributes || []).map((a: ProductAttribute) => ({
-        label: a.label,
-        value: a.value,
-      })),
+      attributes: attrs,
     });
     setImagePreview(productImages[product.id] || null);
     setShowForm(true);
@@ -263,6 +285,7 @@ export default function ProductsPage() {
 
       const payloadData = {
         name: formData.name.trim(),
+        bill_name: formData.bill_name.trim() || null,
         sku,
         price,
         category_id: formData.category_id,
@@ -309,9 +332,18 @@ export default function ProductsPage() {
   };
 
   const handleAddToBill = (product: Product) => {
-    queuePendingBillItems(productToBillItem(product, 1));
-    setSuccess(`"${product.name}" queued — opening Create Invoice…`);
-    setTimeout(() => router.push('/billing'), 350);
+    setDetailProduct(null);
+    setQtyProduct(product);
+  };
+
+  const confirmAddToBill = (product: Product, qty: number) => {
+    queuePendingBillItems(productToBillItem(product, qty));
+    setToastMessage(
+      qty > 1
+        ? `${product.name} × ${qty} added to bill`
+        : `${product.name} added to bill`
+    );
+    setToastOpen(true);
   };
 
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
@@ -434,8 +466,12 @@ export default function ProductsPage() {
                   </tr>
                 ) : (
                   filteredProducts.map((product) => (
-                    <tr key={product.id}>
-                      <td>
+                    <tr
+                      key={product.id}
+                      className="cursor-pointer"
+                      onClick={() => setDetailProduct(product)}
+                    >
+                      <td onClick={(e) => e.stopPropagation()}>
                         <input
                           type="checkbox"
                           checked={selectedIds.has(product.id)}
@@ -444,7 +480,7 @@ export default function ProductsPage() {
                         />
                       </td>
                       <td>
-                        <div className="size-11 overflow-hidden rounded-lg bg-secondary">
+                        <div className="size-11 overflow-hidden rounded-lg bg-secondary ring-offset-2 hover:ring-2 hover:ring-primary/40">
                           {productImages[product.id] ? (
                             // eslint-disable-next-line @next/next/no-img-element
                             <img src={productImages[product.id]} alt="" className="size-full object-cover" />
@@ -457,6 +493,12 @@ export default function ProductsPage() {
                       </td>
                       <td>
                         <p className="font-semibold text-foreground">{product.name}</p>
+                        {product.bill_name?.trim() &&
+                          product.bill_name.trim() !== product.name && (
+                            <p className="text-xs text-muted-foreground">
+                              Bill: {product.bill_name.trim()}
+                            </p>
+                          )}
                       </td>
                       <td>
                         <span className="inline-flex items-center gap-1 rounded-md bg-secondary px-2 py-0.5 font-mono text-xs">
@@ -483,7 +525,7 @@ export default function ProductsPage() {
                             .join(' · ') || '—'}
                         </p>
                       </td>
-                      <td>
+                      <td onClick={(e) => e.stopPropagation()}>
                         <div className="flex justify-end gap-1">
                           <button
                             type="button"
@@ -552,7 +594,11 @@ export default function ProductsPage() {
       ) : (
         <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           {filteredProducts.map((product) => (
-            <div key={product.id} className="bp-card overflow-hidden">
+            <div
+              key={product.id}
+              className="bp-card cursor-pointer overflow-hidden transition hover:border-primary/40 hover:shadow-md"
+              onClick={() => setDetailProduct(product)}
+            >
               <div className="aspect-[4/3] bg-secondary">
                 {productImages[product.id] ? (
                   // eslint-disable-next-line @next/next/no-img-element
@@ -568,8 +614,21 @@ export default function ProductsPage() {
                   <h3 className="font-semibold">{product.name}</h3>
                   <span className="text-sm font-bold text-primary">{formatCurrency(product.price || 0)}</span>
                 </div>
+                {product.bill_name?.trim() &&
+                  product.bill_name.trim() !== product.name && (
+                    <p className="text-xs text-muted-foreground">
+                      Bill: {product.bill_name.trim()}
+                    </p>
+                  )}
                 <p className="font-mono text-xs text-muted-foreground">{product.sku || product.code}</p>
-                <button type="button" onClick={() => handleAddToBill(product)} className="bp-btn-primary w-full">
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    handleAddToBill(product);
+                  }}
+                  className="bp-btn-primary w-full"
+                >
                   <ShoppingCart className="size-3.5" />
                   Add to bill
                 </button>
@@ -581,12 +640,17 @@ export default function ProductsPage() {
 
       {/* Add / Edit modal */}
       {showForm && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/45 p-4">
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center overflow-hidden bg-black/45 p-4"
+          onWheel={(e) => e.stopPropagation()}
+          onTouchMove={(e) => e.stopPropagation()}
+        >
           <form
             onSubmit={handleSubmit}
-            className="grid max-h-[92vh] w-full max-w-4xl grid-cols-1 overflow-hidden rounded-2xl bg-white shadow-2xl lg:grid-cols-[1fr_280px]"
+            className="grid max-h-[92vh] w-full max-w-4xl grid-cols-1 overflow-hidden rounded-2xl bg-white shadow-2xl lg:grid-cols-[minmax(0,1fr)_280px] lg:grid-rows-1"
+            onClick={(e) => e.stopPropagation()}
           >
-            <div className="overflow-y-auto p-6 space-y-4">
+            <div className="min-h-0 max-h-[92vh] overflow-y-auto overscroll-contain p-6 pb-10 space-y-4">
               <div className="flex items-center justify-between">
                 <h2 className="text-lg font-bold tracking-tight">
                   {editingProduct ? 'Edit product' : 'Add new product'}
@@ -598,7 +662,7 @@ export default function ProductsPage() {
 
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="sm:col-span-2">
-                  <label className="bp-label">Product name *</label>
+                  <label className="bp-label">Product name * (for search)</label>
                   <input
                     required
                     className="bp-input"
@@ -614,6 +678,105 @@ export default function ProductsPage() {
                     placeholder="Gold chain / Earrings…"
                   />
                 </div>
+                <div className="sm:col-span-2">
+                  <label className="bp-label">Name on bill</label>
+                  <input
+                    className="bp-input"
+                    value={formData.bill_name}
+                    onChange={(e) =>
+                      setFormData((prev) => ({ ...prev, bill_name: e.target.value }))
+                    }
+                    placeholder="What should appear on the invoice (optional)"
+                  />
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    Search uses product name. The bill uses this name when set.
+                  </p>
+                </div>
+              </div>
+
+              <div className="space-y-3 rounded-xl border border-border bg-secondary/30 p-3">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-semibold">Additional details</p>
+                    <p className="text-xs text-muted-foreground">
+                      Bead count, length, weight, metal type, etc.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    className="shrink-0 text-xs font-semibold text-primary hover:underline"
+                    onClick={() =>
+                      setFormData((prev) => ({
+                        ...prev,
+                        attributes: [...prev.attributes, { label: '', value: '' }],
+                      }))
+                    }
+                  >
+                    + More
+                  </button>
+                </div>
+                {(formData.attributes.length
+                  ? formData.attributes
+                  : [
+                      { label: '', value: '' },
+                      { label: '', value: '' },
+                    ]
+                ).map((attr, index) => (
+                  <div key={index} className="flex gap-2">
+                    <input
+                      className="bp-input"
+                      placeholder={index === 0 ? 'e.g. Length' : index === 1 ? 'e.g. Weight' : 'Field name'}
+                      value={attr.label}
+                      onChange={(e) => {
+                        const base =
+                          formData.attributes.length > 0
+                            ? formData.attributes
+                            : [
+                                { label: '', value: '' },
+                                { label: '', value: '' },
+                              ];
+                        const attributes = [...base];
+                        attributes[index] = { ...attributes[index], label: e.target.value };
+                        setFormData((prev) => ({ ...prev, attributes }));
+                      }}
+                    />
+                    <input
+                      className="bp-input"
+                      placeholder={index === 0 ? 'e.g. 18 inch' : index === 1 ? 'e.g. 5g' : 'Value'}
+                      value={attr.value}
+                      onChange={(e) => {
+                        const base =
+                          formData.attributes.length > 0
+                            ? formData.attributes
+                            : [
+                                { label: '', value: '' },
+                                { label: '', value: '' },
+                              ];
+                        const attributes = [...base];
+                        attributes[index] = { ...attributes[index], value: e.target.value };
+                        setFormData((prev) => ({ ...prev, attributes }));
+                      }}
+                    />
+                    <button
+                      type="button"
+                      className="rounded-lg p-2 text-red-500 hover:bg-red-50"
+                      onClick={() =>
+                        setFormData((prev) => ({
+                          ...prev,
+                          attributes:
+                            prev.attributes.length <= 1
+                              ? [{ label: '', value: '' }]
+                              : prev.attributes.filter((_, i) => i !== index),
+                        }))
+                      }
+                    >
+                      <X className="size-4" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-2">
                 <div>
                   <label className="bp-label">SKU</label>
                   <div className="flex gap-2">
@@ -653,7 +816,9 @@ export default function ProductsPage() {
                     min="0"
                     step="0.01"
                     className="bp-input"
+                    placeholder="Enter price"
                     value={formData.price}
+                    onFocus={(e) => e.target.select()}
                     onChange={(e) => {
                       const price = e.target.value;
                       setFormData((prev) => ({
@@ -697,7 +862,7 @@ export default function ProductsPage() {
                     placeholder="Piece / Pair / Set"
                   />
                 </div>
-                <div className="sm:col-span-2">
+                <div className="sm:col-span-2 space-y-2">
                   <label className="bp-label">Category</label>
                   <select
                     className="bp-input"
@@ -714,77 +879,24 @@ export default function ProductsPage() {
                       <option key={c.id} value={c.id}>{c.name}</option>
                     ))}
                   </select>
-                  <div className="mt-2 flex gap-2">
+                  <div className="flex gap-2">
                     <input
                       className="bp-input"
                       placeholder="New category…"
                       value={newCategoryName}
                       onChange={(e) => setNewCategoryName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          e.preventDefault();
+                          handleAddCategory();
+                        }
+                      }}
                     />
                     <button type="button" className="bp-btn-outline shrink-0" onClick={handleAddCategory}>
                       + New
                     </button>
                   </div>
                 </div>
-              </div>
-
-              <div className="space-y-2 rounded-xl border border-border bg-secondary/30 p-3">
-                <div className="flex items-center justify-between">
-                  <p className="text-sm font-semibold">Additional details</p>
-                  <button
-                    type="button"
-                    className="text-xs font-semibold text-primary hover:underline"
-                    onClick={() =>
-                      setFormData((prev) => ({
-                        ...prev,
-                        attributes: [...prev.attributes, { label: '', value: '' }],
-                      }))
-                    }
-                  >
-                    + Add field
-                  </button>
-                </div>
-                {formData.attributes.length === 0 && (
-                  <p className="text-xs text-muted-foreground">
-                    Add bead count, length, weight, metal type, etc.
-                  </p>
-                )}
-                {formData.attributes.map((attr, index) => (
-                  <div key={index} className="flex gap-2">
-                    <input
-                      className="bp-input"
-                      placeholder="Field name"
-                      value={attr.label}
-                      onChange={(e) => {
-                        const attributes = [...formData.attributes];
-                        attributes[index] = { ...attributes[index], label: e.target.value };
-                        setFormData((prev) => ({ ...prev, attributes }));
-                      }}
-                    />
-                    <input
-                      className="bp-input"
-                      placeholder="Value"
-                      value={attr.value}
-                      onChange={(e) => {
-                        const attributes = [...formData.attributes];
-                        attributes[index] = { ...attributes[index], value: e.target.value };
-                        setFormData((prev) => ({ ...prev, attributes }));
-                      }}
-                    />
-                    <button
-                      type="button"
-                      className="rounded-lg p-2 text-red-500 hover:bg-red-50"
-                      onClick={() =>
-                        setFormData((prev) => ({
-                          ...prev,
-                          attributes: prev.attributes.filter((_, i) => i !== index),
-                        }))
-                      }
-                    >
-                      <X className="size-4" />
-                    </button>
-                  </div>
-                ))}
               </div>
 
               <div>
@@ -867,6 +979,28 @@ export default function ProductsPage() {
           setShowLabels(false);
           setLabelProducts([]);
         }}
+      />
+
+      <ProductDetailModal
+        open={Boolean(detailProduct)}
+        product={detailProduct}
+        imageUrl={detailProduct ? productImages[detailProduct.id] : null}
+        onClose={() => setDetailProduct(null)}
+        onAddToBill={handleAddToBill}
+      />
+
+      <QtyPrompt
+        open={Boolean(qtyProduct)}
+        product={qtyProduct}
+        imageUrl={qtyProduct ? productImages[qtyProduct.id] : null}
+        onClose={() => setQtyProduct(null)}
+        onConfirm={confirmAddToBill}
+      />
+
+      <ToastNotify
+        open={toastOpen}
+        message={toastMessage}
+        onClose={() => setToastOpen(false)}
       />
     </AppLayout>
   );

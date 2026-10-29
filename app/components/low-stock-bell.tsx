@@ -78,7 +78,7 @@ export function LowStockBell() {
           )}
           {count > 0 && (
             <Link
-              href="/inventory?filter=low"
+              href="/inventory/?filter=low"
               onClick={() => setOpen(false)}
               className="mt-3 inline-flex text-xs font-semibold text-primary underline-offset-2 hover:underline"
             >
